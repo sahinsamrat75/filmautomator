@@ -75,3 +75,25 @@ fps = 24
 max_shot_revision_rounds = 4
 max_task_retries = 3
 max_agent_calls_per_task = 40
+
+[storage]
+# Working-storage ceiling. This governs disposable production artifacts
+# (frames, previews, temporaries) — NOT your finalized movies, which are
+# never deleted to make room.
+#
+# States: NORMAL < warning < AGGRESSIVE_CLEANUP < HARD_LIMIT
+#   < 25 GB          nothing happens
+#   25-30 GB         the owner is told the disk is filling
+#   30-35 GB         disposable artifacts are reclaimed automatically
+#   >= 35 GB         no new large render starts until a safe cleanup frees room
+#
+# Cleanup only ever removes an intermediate whose replacement has been
+# promoted and verified: a shot's frames survive until that shot's MP4
+# exists, is non-zero, is registered, and probes as valid video.
+max_working_gb = 35.0
+warning_gb = 25.0
+aggressive_cleanup_gb = 30.0
+hard_limit_gb = 35.0
+cleanup_enabled = true
+# Headroom assumed when checking whether a large render will fit.
+estimated_render_gb = 2.0

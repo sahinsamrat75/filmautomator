@@ -27,6 +27,11 @@ log = logging.getLogger(__name__)
 
 #: Artifact kinds a finished production must have on disk. Missing any of these
 #: means the production did not actually deliver, whatever the database says.
+#:
+#: ``preview`` is required only while a shot is still under review. Once a shot
+#: is FINAL its preview has served its purpose and is released by the storage
+#: governor along with the frames, so demanding it forever would make a correctly
+#: cleaned-up production fail verification. See :func:`required_kinds_for`.
 REQUIRED_KINDS: tuple[str, ...] = (
     "preview",
     "shot_video",
@@ -38,6 +43,30 @@ REQUIRED_KINDS: tuple[str, ...] = (
 #: The deliverable itself. Named separately because it carries the strictest
 #: requirement: it must exist, be non-empty, and probe as playable video.
 FINAL_KIND = "final_movie"
+
+
+def required_kinds_for(db: Any, project_id: str) -> tuple[str, ...]:
+    """The artifact kinds this project must still have on disk.
+
+    Drops ``preview`` when every shot carrying one has been finalized, because
+    the storage governor releases a finalized shot's frames and preview together
+    — the MP4 is the surviving record. Keeping the requirement unconditional
+    would mean a production that correctly reclaimed space failed its own
+    integrity check.
+    """
+    try:
+        shots = db.list_shots(project_id)
+    except Exception:  # noqa: BLE001 - fall back to the full requirement
+        return REQUIRED_KINDS
+    if not shots:
+        return REQUIRED_KINDS
+
+    from .finalization import SHOT_FINAL
+
+    # A preview is still required while any shot is not FINAL.
+    if any(shot.get("status") != SHOT_FINAL for shot in shots):
+        return REQUIRED_KINDS
+    return tuple(kind for kind in REQUIRED_KINDS if kind != "preview")
 
 
 @dataclass
@@ -121,7 +150,7 @@ def verify_project(
     db: Any,
     project_id: str,
     *,
-    required_kinds: Iterable[str] = REQUIRED_KINDS,
+    required_kinds: Iterable[str] | None = None,
     encoder: VideoEncoder | None = None,
     probe_final: bool = True,
 ) -> IntegrityReport:
@@ -131,7 +160,13 @@ def verify_project(
     claim to be tested, never as evidence.
     """
     report = IntegrityReport(project_id=project_id)
-    required = tuple(required_kinds)
+    # When the caller does not pin the set, derive it from the project's actual
+    # state so a shot-first production that has released its frames and previews
+    # is not failed for having done so correctly.
+    required = (
+        tuple(required_kinds) if required_kinds is not None
+        else required_kinds_for(db, project_id)
+    )
     encoder = encoder or VideoEncoder()
 
     try:

@@ -169,6 +169,38 @@ Open <http://127.0.0.1:8765>. You will see the current agent, the current shot,
 the progress bar, the agent activity feed, and the latest Blender preview —
 appearing the moment it is rendered, with no refresh.
 
+### Connecting ChatGPT and other remote MCP clients
+
+**Every client drives the same backend.** There is no ChatGPT-specific Producer,
+no separate project database, no separate Blender pipeline and no separate shot
+system. A project created from Claude Desktop is the same project ChatGPT sees,
+with the same shots, artifacts, storage governor and QA.
+
+| Client | Transport | Status |
+|---|---|---|
+| Claude Desktop (`.mcpb`) | stdio | Primary target, fully supported |
+| Claude Code | stdio | Fully supported |
+| ChatGPT / remote MCP | stdio over a secure tunnel | Supported where the surface exposes remote MCP |
+
+The default transport is stdio, which binds nothing to the network. The optional
+HTTP transport binds `127.0.0.1` only and is disabled by default.
+
+Because ChatGPT's connectors reach a *remote* endpoint rather than a local
+process, expose the server through an owner-controlled secure tunnel — an SSH
+reverse tunnel or an mTLS-authenticated proxy. **The server never opens a public
+port for itself.** Be aware that support depends on your ChatGPT plan and
+surface exposing remote MCP; where a surface does not, this is a client
+limitation rather than a backend one. `get_client_compatibility` reports the
+live picture from the server itself.
+
+### Audio
+
+Audio capabilities exist without requiring any large local model. `generate_audio`
+covers dialogue, music, SFX and ambience using local deterministic synthesis, and
+every artifact is labelled `synthetic` so a stand-in is never presented as a
+finished recording. Real models can be attached to these capabilities later
+without changing the interface.
+
 ### 5. Collect the movie
 
 ```bash
@@ -228,30 +260,109 @@ each revision of a shot gets its own `vNNN/` directory.
 
 `projects/registry.db` indexes all projects.
 
+### The storage governor
+
+Filmautomator measures its own **working storage** — frames, previews,
+temporaries and other disposable production artifacts — and keeps it under a
+configurable ceiling, 35 GB by default. This is a limit on working space, not on
+deliverables: a finalized movie is never deleted to make room.
+
+| State | Working storage | What happens |
+|---|---|---|
+| `NORMAL` | < 25 GB | nothing |
+| `WARNING` | 25–30 GB | reported on the dashboard and over MCP |
+| `AGGRESSIVE_CLEANUP` | 30–35 GB | disposable artifacts are reclaimed |
+| `HARD_LIMIT` | ≥ 35 GB | **no new large render starts** until a safe cleanup frees room |
+
+The rule that makes cleanup safe:
+
+> **Never delete an intermediate until its replacement has been promoted and
+> verified.**
+
+So rendered frames are *candidates*, not garbage. A frame set becomes deletable
+only once its shot's MP4 exists, is non-empty, is registered, and probes as real
+video. A failed render keeps its frames. A failed encode keeps them. A vanished
+MP4 keeps them. If the disk is full and nothing is safely deletable, production
+stops and says why rather than deleting something precious.
+
+Configure it in `filmautomator.toml`:
+
+```toml
+[storage]
+max_working_gb = 35.0
+warning_gb = 25.0
+aggressive_cleanup_gb = 30.0
+hard_limit_gb = 35.0
+cleanup_enabled = true
+```
+
+Inspect it with `get_storage_status`, reclaim with `cleanup_storage` (supports
+`dry_run`), and see it live on the dashboard.
+
+### Shot finalization
+
+A shot becomes `FINAL` only when all ten conditions hold: the MP4 exists, is
+non-zero, ffprobe succeeds, it has a video stream, the codec and resolution and
+frame rate are valid, the duration is within tolerance, the artifact registry
+points at that exact file, and the file is still present after all of that ran.
+Only then are its frames released.
+
+Use `get_resume_point` to see where production should continue, and
+`invalidate_shot` to force one shot to be rebuilt without touching its
+neighbours.
+
 ---
 
 ## The MCP tools
 
-50 tools, grouped:
+65 tools, grouped:
 
 | Group | Tools |
 |---|---|
 | **Projects** | `create_project` `list_projects` `get_project` `delete_project` |
-| **Production** | `start_production` `pause_production` `resume_production` `stop_production` `get_production_status` |
+| **Production** | `start_production` `resume_production_from` `pause_production` `resume_production` `stop_production` `get_production_status` |
 | **Director** | `submit_objective` `get_director_status` `get_director_decision` `approve_director_decision` |
 | **Tasks** | `list_tasks` `get_task` `retry_task` `cancel_task` `approve_task` `reject_task` |
 | **Scenes** | `list_scenes` `get_scene` `create_scene` `render_scene_preview` |
-| **Shots** | `list_shots` `get_shot` `create_shot` `render_shot_preview` `render_shot_final` `approve_shot` `reject_shot` |
+| **Shots** | `list_shots` `get_shot` `create_shot` `render_shot_preview` `correct_shot` `finalize_shot` `render_shot_final` `approve_shot` `reject_shot` `invalidate_shot` `get_resume_point` |
+| **Continuity** | `define_character` `get_character` `list_characters` `define_environment` `list_environments` |
+| **Audio** | `generate_audio` `plan_dialogue` |
+| **Storage** | `get_storage_status` `cleanup_storage` |
 | **Blender** | `inspect_blender` `inspect_scene` `inspect_objects` `get_viewport_preview` |
 | **Vision** | `inspect_preview` `get_visual_evaluation` |
 | **Artifacts** | `list_artifacts` `get_artifact` `get_preview` `get_render` `get_final_movie` |
 | **Agents** | `list_agents` `get_agent_status` `get_agent_activity` |
 | **QA** | `run_qa` `get_qa_status` `get_qa_report` |
-| **Control** | `pause` `resume` `stop` |
+| **Control** | `pause` `resume` `stop` `get_client_compatibility` |
 
-`get_preview` and `render_shot_preview` return the image itself, not a path — so
-the AI looks at the same pixels the Vision Agent judged and you see on the
-dashboard.
+### The AI visual-director loop
+
+`render_shot_preview` returns **the actual rendered image** as an MCP image
+content block, not a path to one, along with the shot's camera, duration, frame
+rate, render settings and artifact path. You are meant to look at it, decide
+what is wrong, and say so:
+
+```
+render_shot_preview   → you receive real pixels
+    ↓
+"the head is too close to the top of frame and the lens is too long"
+    ↓
+correct_shot(camera_height_m=1.2, lens_mm=35, shot_size="medium_wide")
+    ↓
+render_shot_preview   → you receive the corrected frame
+    ↓
+approve → finalize_shot → verified MP4 → frames released
+```
+
+Every response states `"image_delivered": true|false`. When it is false the
+response says why, so a client can never believe it inspected a frame it never
+received. Clients that cannot display images may set
+`capabilities.imageContent = false` and receive metadata plus an explicit note.
+
+No local vision model is required. The external AI client *is* the visual
+reasoning system; the built-in Vision Agent is a supporting technical check and
+labels its pixel-statistical findings `heuristic_only` rather than pretending to
+semantic understanding.
 
 ### Safety
 

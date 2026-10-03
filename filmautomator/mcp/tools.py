@@ -155,6 +155,10 @@ class ToolContext:
     _db: ProjectDB | None = None
     _session: BlenderSession | None = None
     _lock: threading.RLock = field(default_factory=threading.RLock)
+    #: Capabilities the connected MCP client advertised at initialize. Tools
+    #: that can return images read this to decide whether to attach one or
+    #: report that the client cannot receive images.
+    client_capabilities: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def create(cls, config: AppConfig | None = None) -> "ToolContext":

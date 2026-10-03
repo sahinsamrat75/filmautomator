@@ -119,12 +119,21 @@ class FinalQA:
         frames_by_shot: dict[str, Path] | None = None,
         expected_audio: bool = False,
         duration_tolerance_s: float = 1.5,
+        finalized_shots: set[str] | None = None,
     ) -> QAReport:
         report = QAReport()
         frames_by_shot = frames_by_shot or {}
+        # A shot that was promoted and verified has had its frames released by
+        # the storage governor, which is correct behaviour rather than a defect.
+        # Passing the set explicitly keeps QA from reporting reclaimed frames as
+        # missing work.
+        finalized = finalized_shots or set()
 
         for spec, video in zip(shots, shot_videos):
-            self._check_shot_visual(report, spec, frames_by_shot.get(spec.shot_id))
+            self._check_shot_visual(
+                report, spec, frames_by_shot.get(spec.shot_id),
+                released=spec.shot_id in finalized,
+            )
             self._check_shot_technical(report, spec, Path(video))
 
         self._check_story(report, shots, shot_videos, duration_tolerance_s)
@@ -144,7 +153,23 @@ class FinalQA:
     # -- visual ------------------------------------------------------------
 
     def _check_shot_visual(self, report: QAReport, spec: ShotSpec,
-                           frames_dir: Path | None) -> None:
+                           frames_dir: Path | None, *,
+                           released: bool = False) -> None:
+        frames = find_frame_sequence(frames_dir) if frames_dir else []
+
+        if not frames and released:
+            # The shot was promoted and verified, then its frames were released
+            # to reclaim storage. The MP4 is the surviving record, and the shot
+            # video is checked independently below.
+            report.checks.append(QACheck(
+                scope="visual", name="frames_released_after_final",
+                passed=True,
+                detail=(f"{spec.shot_id}: frames released after the shot was "
+                        f"promoted and verified."),
+                subject=spec.shot_id, severity="minor",
+            ))
+            return
+
         if frames_dir is None:
             report.checks.append(QACheck(
                 scope="visual", name="frames_rendered", passed=False,
@@ -154,7 +179,6 @@ class FinalQA:
             ))
             return
 
-        frames = find_frame_sequence(frames_dir)
         expected = spec.frame_count_at(self.fps)
 
         report.checks.append(QACheck(

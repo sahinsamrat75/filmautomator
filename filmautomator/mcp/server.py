@@ -25,6 +25,8 @@ from typing import Any, TextIO
 
 from .. import __version__
 from ..config import AppConfig, load_config
+from . import continuity_tools  # noqa: F401 - registers continuity + audio tools
+from . import director_tools  # noqa: F401 - registers the director-loop tools
 from . import toolset  # noqa: F401 - registers the tools on import
 from .protocol import (
     INTERNAL_ERROR,
@@ -42,6 +44,7 @@ from .protocol import (
     result_response,
     tool_result,
 )
+from .preview import client_accepts_images
 from .tools import ToolContext, get_tool, list_tools
 
 log = logging.getLogger(__name__)
@@ -49,23 +52,47 @@ log = logging.getLogger(__name__)
 INSTRUCTIONS = """\
 Filmautomator is an autonomous film studio running on this machine. You give it
 a creative objective in plain language and it plans shots, builds them in
-Blender, renders previews, reviews them with a Vision Agent, corrects what looks
-wrong, renders at final quality, and assembles the result with FFmpeg.
+Blender, renders previews, corrects what looks wrong, renders at final quality,
+and assembles the result with FFmpeg.
 
-Typical flow:
+Blender is the renderer. There is no AI video-generation model in this pipeline
+and none is required: you decide what should be created, Blender creates the
+actual pixels, FFmpeg encodes them.
+
+The shot-by-shot workflow:
+
   1. create_project(name, objective)         -> project_id
+  2. create_shot(project_id, shot_id, ...)   -> describe the shot
+  3. render_shot_preview(project_id, shot_id)-> returns the ACTUAL IMAGE
+  4. inspect the image you received           -> your judgement is the director's eye
+  5. correct_shot(project_id, shot_id, ...)  -> change camera, lens, lighting, framing
+  6. render_shot_preview again                -> see the result
+  7. finalize_shot(project_id, shot_id)      -> final render, encode, verify, release frames
+  8. next shot
+
+You are the visual reasoning system. When a preview comes back with
+"image_delivered": true, you are looking at the real render and should critique
+it concretely — framing, headroom, lens, exposure, whether the subject reads at
+the intended size — then change it with correct_shot. When it says
+"image_delivered": false, you did NOT receive an image; the note explains why,
+and you must not pretend to have seen the frame.
+
+For a hands-off run instead:
+
+  1. create_project(name, objective)
   2. start_production(project_id, duration_s) -> returns immediately
-  3. get_production_status()                  -> poll until state is COMPLETED
-  4. get_preview(project_id, shot_id)         -> look at what it rendered
-  5. get_final_movie(project_id)              -> the deliverable and its path
+  3. get_production_status()                  -> poll until COMPLETED
+  4. get_final_movie(project_id)              -> the deliverable and its path
 
-Production runs in the background and can take minutes, so do not expect
-start_production to block. Use get_agent_activity to follow what the agents are
-doing, and get_preview to see the same frames the Vision Agent judged.
+Production runs in the background and can take minutes, so start_production does
+not block. Use get_agent_activity to follow what the agents are doing.
 
-There is no tool for running shell commands or arbitrary code, by design. If you
-need the scene changed, describe the change as an objective and let the Director
-translate it.
+Storage is governed: a configurable ceiling (35 GB by default) covers working
+artifacts. Call get_storage_status to see it. Frames are released only after a
+shot's MP4 has been encoded and verified, so a shot never loses its only copy.
+
+There is no tool for running shell commands or arbitrary code, by design. To
+change the scene, describe the change and let the Director translate it.
 """
 
 
@@ -77,6 +104,11 @@ class MCPServer:
         self.config = config or load_config()
         self.context = context or ToolContext.create(self.config)
         self._initialised = False
+        #: Capabilities the connected client advertised during ``initialize``.
+        #: Recorded so tools can decide whether to attach image content or fall
+        #: back to a text-only description that says so.
+        self.client_capabilities: dict[str, Any] = {}
+        self.client_info: dict[str, Any] = {}
 
     # -- dispatch ----------------------------------------------------------
 
@@ -130,8 +162,18 @@ class MCPServer:
             requested if isinstance(requested, str) else None
         )
         client = params.get("clientInfo") or {}
-        log.info("MCP client connected: %s %s (protocol %s)",
-                 client.get("name", "unknown"), client.get("version", ""), version)
+        # Remembered rather than discarded: a tool that returns an image needs to
+        # know whether this client can actually display one.
+        self.client_info = dict(client) if isinstance(client, dict) else {}
+        capabilities = params.get("capabilities")
+        self.client_capabilities = (
+            dict(capabilities) if isinstance(capabilities, dict) else {}
+        )
+        log.info("MCP client connected: %s %s (protocol %s, image content: %s)",
+                 client.get("name", "unknown"), client.get("version", ""), version,
+                 client_accepts_images(self.client_capabilities))
+        # Tools read capabilities from the context, so keep them in step.
+        self.context.client_capabilities = dict(self.client_capabilities)
         return {
             "protocolVersion": version,
             "capabilities": {"tools": {"listChanged": False}},

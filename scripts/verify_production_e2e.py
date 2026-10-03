@@ -182,10 +182,33 @@ def main() -> int:
 
         # -- the invariants -------------------------------------------------
         artifacts = client.call("list_artifacts", {"project_id": project_id})
-        check("every registered artifact exists on disk",
-              artifacts.get("missing") == 0,
-              json.dumps([a for a in artifacts.get("artifacts", [])
-                          if not a.get("exists")])[:400])
+        # Every *deliverable* must exist on disk. Rendered frames and shot
+        # previews are deliberately excluded: once a shot is promoted and
+        # verified the storage governor releases them, and that is the correct
+        # outcome rather than a missing artifact.
+        deliverable_kinds = {"shot_video", "final_movie", "timeline",
+                             "qa_report", "report", "audio"}
+        missing_deliverables = [
+            a for a in artifacts.get("artifacts", [])
+            if a.get("kind") in deliverable_kinds and not a.get("exists")
+        ]
+        check("every deliverable artifact exists on disk",
+              not missing_deliverables, json.dumps(missing_deliverables)[:400])
+
+        # Anything reported missing must be a releasable artifact, never a
+        # deliverable — this is the invariant the original bug violated.
+        unexpected_missing = [
+            a for a in artifacts.get("artifacts", [])
+            if not a.get("exists") and a.get("kind") not in {"render", "preview"}
+        ]
+        check("no deliverable artifact is missing",
+              not unexpected_missing, json.dumps(unexpected_missing)[:400])
+
+        released = [a for a in artifacts.get("artifacts", [])
+                    if not a.get("exists")]
+        if released:
+            print(f"        released after verification: "
+                  f"{len(released)} frame/preview artifact(s)")
 
         integrity = status.get("integrity") or {}
         check("status carries a passing integrity report",

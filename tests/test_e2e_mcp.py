@@ -109,11 +109,13 @@ def test_full_production_through_mcp(server: MCPServer):
     assert status["state"] == "COMPLETED", status
     assert status["percent"] == 100.0
 
-    # 4. Shots exist and were approved.
+    # 4. Shots exist and were promoted through the finalization contract.
+    #    FINAL is stricter than the old APPROVED: it means the shot's MP4 was
+    #    verified on disk, not merely that it passed the review loop.
     shots = payload(server, "list_shots", {"project_id": project_id})
     assert shots["count"] >= 1
     shot_id = shots["shots"][0]["shot_id"]
-    assert shots["shots"][0]["status"] == "APPROVED"
+    assert shots["shots"][0]["status"] == "FINAL"
 
     # 5. The preview is retrievable as an actual image — the same frame the
     #    Vision Agent judged. This is what makes the production transparent.
@@ -249,10 +251,24 @@ def test_a_healthy_production_reports_verified_integrity(server: MCPServer):
     assert movie["resolution"] == f"{WIDTH}x{HEIGHT}"
     assert movie["size_mb"] > 0
 
-    # Every registered artifact must be present — this is the invariant the
-    # original bug violated.
+    # Every deliverable artifact must be present — this is the invariant the
+    # original bug violated. Frames and previews are deliberately excluded: the
+    # storage governor releases them once a shot is promoted and verified, which
+    # is correct behaviour rather than a missing artifact.
     artifacts = payload(server, "list_artifacts", {"project_id": project_id})
-    assert artifacts["missing"] == 0, artifacts["artifacts"]
+    deliverable_kinds = {"shot_video", "final_movie", "qa_report", "report",
+                         "timeline"}
+    missing_deliverables = [
+        a for a in artifacts["artifacts"]
+        if a["kind"] in deliverable_kinds and not a["exists"]
+    ]
+    assert not missing_deliverables, missing_deliverables
+
+    # Anything still reported missing must be an artifact that is *allowed* to be
+    # released — a shot's frames or preview — never a deliverable.
+    for artifact in artifacts["artifacts"]:
+        if not artifact["exists"]:
+            assert artifact["kind"] in {"render", "preview"}, artifact
 
     # The report the production wrote must itself exist.
     assert Path(status.get("integrity", {}).get("final_movie", "")).is_file()

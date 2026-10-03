@@ -4,7 +4,7 @@
   "display_name": "FilmAutomator",
   "version": "0.1.0",
   "description": "Autonomous AI filmmaking on Blender and FFmpeg: plan shots, build scenes, review renders, and produce a finished movie.",
-  "long_description": "FilmAutomator turns a plain-language objective into a finished film using software already on this machine.\n\nGive it a creative brief and it plans shots, builds each one in Blender, renders a preview, inspects that preview with a Vision Agent, corrects what looks wrong, renders at final quality, and assembles the result with FFmpeg.\n\n**No paid services.** It runs entirely locally on Blender, FFmpeg, Python and SQLite. A model server (LM Studio, Ollama, llama.cpp) is optional: without one it falls back to a deterministic plan and judges frames from pixel measurement alone, labelling every synthetic decision as such.\n\n**What it does not do.** This is a production tool, not a chat toy. It renders real frames, which takes real time — `start_production` returns immediately and the work continues in the background. Because a production owns a Blender session on one machine, only one runs at a time.\n\n**Requirements on this machine.** Blender 4.x/5.x and FFmpeg must already be installed (`brew install --cask blender ffmpeg`). Use the `doctor` tool or `filmautomator doctor` to check.\n\nThe server speaks MCP over stdio and binds nothing to the network.",
+  "long_description": "FilmAutomator turns a plain-language objective into a finished film using software already on this machine.\n\nGive it a creative brief and it plans shots, builds each one in Blender, renders a preview, hands you the actual image so you can judge it, corrects what you object to, renders at final quality, and assembles the result with FFmpeg.\n\n**Blender is the renderer.** There is no AI video-generation model in this pipeline and none is required: you decide what should be created, Blender creates the actual pixels, FFmpeg encodes them.\n\n**You are the director.** `render_shot_preview` returns the real rendered image, not a path to one. Look at it, then call `correct_shot` to change the camera, lens or lighting, and preview again.\n\n**Storage is governed.** A configurable ceiling (35 GB by default) covers working artifacts. Frames are released only after a shot's MP4 has been encoded and verified, so a shot never loses its only copy.\n\n**No paid services.** It runs entirely locally on Blender, FFmpeg, Python and SQLite. A model server (LM Studio, Ollama, llama.cpp) is optional: without one it falls back to a deterministic plan and judges frames from pixel measurement alone, labelling every synthetic decision as such.\n\n**What it does not do.** This is a production tool, not a chat toy. It renders real frames, which takes real time — `start_production` returns immediately and the work continues in the background. Because a production owns a Blender session on one machine, only one runs at a time.\n\n**Requirements on this machine.** Blender 4.x/5.x and FFmpeg must already be installed (`brew install --cask blender ffmpeg`). Use the `doctor` tool or `filmautomator doctor` to check.\n\nThe server speaks MCP over stdio and binds nothing to the network.",
   "author": {
     "name": "Sahin Samrat",
     "url": "https://github.com/sahinsamrat75"
@@ -72,6 +72,22 @@
     {
       "name": "start_production",
       "description": "Begin producing a film in the background from a plain-language objective."
+    },
+    {
+      "name": "render_shot_preview",
+      "description": "Render a shot preview and return the actual image so you can inspect it."
+    },
+    {
+      "name": "correct_shot",
+      "description": "Change a shot's camera, lens or lighting after looking at its preview."
+    },
+    {
+      "name": "finalize_shot",
+      "description": "Render, encode, verify a shot and release its frames once promoted."
+    },
+    {
+      "name": "get_storage_status",
+      "description": "Working storage usage against the configurable ceiling, and what is reclaimable."
     },
     {
       "name": "get_production_status",

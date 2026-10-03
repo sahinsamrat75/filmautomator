@@ -204,6 +204,11 @@ class ShotProduction:
     final_report: QualityReport | None = None
     history: list[dict[str, Any]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
+    #: True only once the shot passed the finalization contract: its MP4 exists,
+    #: is non-empty, is registered, and probes as valid video. A shot with a
+    #: video_path but final=False has not been promoted and its frames must be
+    #: kept.
+    final: bool = False
 
 
 @dataclass

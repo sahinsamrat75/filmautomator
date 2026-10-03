@@ -31,6 +31,7 @@ from ..post.ffmpeg import FFmpegError, VideoEncoder
 from ..qa import FinalQA
 from ..runtime import RunState
 from ..producer import ProductionRequest
+from .preview import build_preview_metadata, deliver_preview
 from .protocol import image_content, json_text, text_content, tool_result
 from .tools import (
     MCPError,
@@ -751,36 +752,6 @@ def tool_create_shot(ctx: ToolContext, args: dict) -> dict:
     return ok({"shot_id": shot_id, "created": True, "spec": parsed.to_dict()})
 
 
-@tool("render_shot_preview",
-      "Build the shot in Blender and render a fresh preview, returning the "
-      "image itself. This is the same frame the Vision Agent judges — use it "
-      "to see what the system sees.",
-      properties={"project_id": {"type": "string"},
-                  "shot_id": {"type": "string"}},
-      required=["project_id", "shot_id"])
-def tool_render_shot_preview(ctx: ToolContext, args: dict) -> dict:
-    project_id = require_str(args, "project_id")
-    shot_id = require_str(args, "shot_id")
-    project, workspace = ctx.project_and_workspace(project_id)
-    spec = _shot_spec(ctx.db, project_id, shot_id)
-
-    context = _agent_context(ctx, project_id)
-    blender = BlenderAgent(context, ctx.session(), ctx.config.render)
-    task = Task(objective=f"preview {shot_id}", agent="blender_agent",
-                project_id=project_id)
-    blender.build_shot(task, spec, 1)
-    preview = blender.render_preview(task, spec, 1)
-
-    blocks = [json_text({"shot_id": shot_id,
-                         "preview": str(preview.image_path),
-                         "background_plate": str(preview.background_path or ""),
-                         "engine": preview.engine})]
-    image = _image_block(preview.image_path)
-    if image:
-        blocks.append(image)
-    return tool_result(blocks)
-
-
 @tool("render_shot_final",
       "Render a shot at final quality and encode it to video. Does not run "
       "the Vision review loop — use start_production for that.",
@@ -1019,10 +990,13 @@ def tool_get_artifact(ctx: ToolContext, args: dict) -> dict:
 
 
 @tool("get_preview",
-      "Return the latest preview image for a shot (or the project) as an "
-      "actual image you can look at.",
+      "Return the latest preview image for a shot (or the project) as an actual "
+      "image you can look at, with its camera, duration and render settings. "
+      "If your client cannot receive images the response says so explicitly.",
       properties={"project_id": {"type": "string"},
-                  "shot_id": {"type": "string"}})
+                  "shot_id": {"type": "string"},
+                  "include_image": {"type": "boolean",
+                                    "description": "Set false for metadata only."}})
 def tool_get_preview(ctx: ToolContext, args: dict) -> dict:
     project_id = require_str(args, "project_id")
     shot_id = require_str(args, "shot_id")
@@ -1034,13 +1008,55 @@ def tool_get_preview(ctx: ToolContext, args: dict) -> dict:
 
     artifact = ctx.db.latest_artifact(project_id, "preview", shot_id or None)
     if artifact is None:
-        return fail("no preview has been produced yet")
-    image = _image_block(artifact["path"])
-    if image is None:
-        return fail(f"preview file is missing: {artifact['path']}")
-    return tool_result([json_text({"path": artifact["path"],
-                                   "shot_id": artifact["shot_id"],
-                                   "created_at": artifact["created_at"]}), image])
+        return fail("no preview has been produced yet; call render_shot_preview")
+
+    path = Path(artifact["path"])
+    if not path.is_file() and artifact.get("shot_id"):
+        # Once a shot is FINAL the storage governor releases the in-shot preview
+        # along with its frames. The mirrored copy under previews/ survives,
+        # because a small still image is worth keeping as the shot's visual
+        # record — fall back to it rather than reporting the preview as lost.
+        mirror = ctx.config.workspace / project_id / "previews" / (
+            f"{artifact['shot_id']}_v001.png"
+        )
+        if mirror.is_file():
+            path = mirror
+
+    spec: dict = {}
+    if artifact.get("shot_id"):
+        try:
+            spec = ShotSpec.from_dict(
+                (ctx.db.get_shot(project_id, artifact["shot_id"]) or {})
+                .get("spec") or {}
+            ).to_dict()
+        except Exception:  # noqa: BLE001 - metadata is a bonus, not required
+            spec = {}
+
+    delivery = deliver_preview(
+        artifact.get("shot_id") or shot_id or "",
+        path,
+        metadata=build_preview_metadata(
+            shot_id=artifact.get("shot_id", ""),
+            scene_id=artifact.get("scene_id", ""),
+            duration_s=spec.get("duration_s", 0.0),
+            fps=ctx.config.render.fps,
+            camera=(spec.get("camera") or {}),
+            render_settings={
+                "preview_engine": ctx.config.render.preview_engine,
+                "preview_resolution":
+                    f"{ctx.config.render.preview_width}x"
+                    f"{ctx.config.render.preview_height}",
+            },
+            artifact_path=str(path),
+            extra={"created_at": artifact.get("created_at", "")},
+        ),
+        client_capabilities=ctx.client_capabilities,
+        include_image=require_bool(args, "include_image", True),
+    )
+    blocks = [json_text(delivery.to_dict())]
+    if delivery.image_block:
+        blocks.append(delivery.image_block)
+    return tool_result(blocks)
 
 
 @tool("get_render",

@@ -31,9 +31,16 @@ from .agents import AgentContext, BlenderAgent, Director, PlanResult, ShotProduc
 from .blender.session import BlenderSession, BlenderUnavailable
 from .config import AppConfig, find_blender, load_config
 from .core.events import EventBus, EventKind
+from .core.finalization import SHOT_FINAL, finalize_shot
 from .core.integrity import verify_project
 from .core.project import ProjectDB
 from .core.spec import ShotSpec
+from .core.storage import (
+    StorageGovernor,
+    StorageRefused,
+    StorageState,
+    StorageUsage,
+)
 from .core.task import QAStatus, Task, TaskStatus
 from .core.workspace import Workspace
 from .gateway import ModelGateway
@@ -131,6 +138,9 @@ class Producer:
         self.session: BlenderSession | None = None
         self._db: ProjectDB | None = None
         self._workspace: Workspace | None = None
+        #: Working-storage budget. Created lazily because it needs the resolved
+        #: workspace root, which is only known once a project starts.
+        self._governor: StorageGovernor | None = None
         #: Optional cooperative stop/pause gate, injected by ProductionRunner.
         self.control: Any = None
         #: Called with the project id as soon as it is known. The runner uses
@@ -145,6 +155,83 @@ class Producer:
         """Yield to a pending pause or stop request, if one is set."""
         if self.control is not None:
             self.control.checkpoint()
+
+    # -- storage ----------------------------------------------------------
+
+    @property
+    def governor(self) -> StorageGovernor:
+        """The storage governor for this run, created on first use."""
+        if self._governor is None:
+            self._governor = StorageGovernor(
+                self.config.workspace,
+                thresholds=self.config.storage.thresholds(),
+                db=self._db,
+                encoder=self.encoder,
+                events=self.events,
+            )
+        return self._governor
+
+    def _storage_report(self) -> StorageUsage:
+        return self.governor.measure()
+
+    def _ensure_render_capacity(self, project_id: str) -> None:
+        """Refuse a large render that cannot fit, after trying a safe cleanup.
+
+        Raises :class:`StorageRefused` rather than deleting something precious
+        to force progress. The caller stops at a checkpoint and reports.
+        """
+        needed = int(self.config.storage.estimated_render_gb * 1024 ** 3)
+        try:
+            usage = self.governor.ensure_capacity(needed_bytes=needed)
+        except StorageRefused as refusal:
+            self.announce(f"storage limit reached: {refusal}")
+            self.events.emit(
+                project_id, EventKind.ERROR,
+                f"refusing to start a large render: {refusal}",
+                agent="storage_governor",
+                payload={"storage": refusal.usage.to_dict()},
+            )
+            raise
+        if usage.state in (StorageState.WARNING, StorageState.AGGRESSIVE_CLEANUP):
+            self.announce(
+                f"storage {usage.state.value}: {usage.total_gb:.1f} GB of "
+                f"{usage.thresholds.hard_limit_bytes / 1024 ** 3:.0f} GB"
+            )
+            self.events.emit(
+                project_id, "storage.warning",
+                f"working storage is {usage.total_gb:.2f} GB ({usage.state.value})",
+                agent="storage_governor", payload=usage.to_dict(),
+            )
+        return None
+
+    def _release_shot_storage(self, project_id: str, shot_id: str,
+                              frames_dir: str = "") -> dict[str, Any] | None:
+        """Release a finalized shot's frames once its MP4 is verified.
+
+        Called only after :func:`finalize_shot` has returned a passing verdict,
+        which is what makes the frames a duplicate rather than the only copy.
+        Returns the cleanup summary, or None when there was nothing to release.
+        """
+        if not self.config.storage.cleanup_enabled:
+            return None
+        try:
+            cleanup = self.governor.cleanup(project_id=project_id)
+        except Exception as exc:  # noqa: BLE001 - cleanup must not fail a run
+            log.warning("post-shot cleanup failed: %s", exc)
+            return None
+        if cleanup.get("freed_bytes"):
+            self.events.emit(
+                project_id, "storage.released",
+                f"released {cleanup['freed_gb']:.3f} GB after {shot_id} was "
+                f"promoted and verified",
+                agent="storage_governor",
+                payload={"freed_bytes": cleanup["freed_bytes"],
+                         "shot_id": shot_id},
+            )
+            self.announce(
+                f"released {cleanup['freed_gb']:.2f} GB after {shot_id}"
+            )
+        return cleanup
 
     # -- progress ----------------------------------------------------------
 
@@ -408,6 +495,22 @@ class Producer:
 
             for shot_spec in shots_to_produce:
                 self.checkpoint()
+
+                # Refuse to start a render that cannot fit, rather than filling
+                # the disk and failing halfway through a shot.
+                try:
+                    self._ensure_render_capacity(project_id)
+                except StorageRefused:
+                    result.notes.append(
+                        "production stopped at the storage limit before "
+                        f"{shot_spec.shot_id}; no unverified frames were deleted"
+                    )
+                    result.error = (
+                        "working storage is at its configured limit and no safe "
+                        "cleanup could free enough space to continue"
+                    )
+                    break
+
                 shot_task = Task(
                     objective=f"Produce {shot_spec.shot_id}: {shot_spec.description}",
                     agent="director", project_id=project_id,
@@ -418,10 +521,42 @@ class Producer:
                 try:
                     production = director.produce_shot(shot_task, shot_spec)
                     result.shots.append(production)
+
+                    # Promote the shot through the finalization contract. A shot
+                    # is FINAL only when its MP4 is physically present, non-empty,
+                    # registered and probes as valid video -- and the frames are
+                    # released only on the strength of that verdict.
+                    finalization = None
+                    if production.video_path:
+                        finalization = finalize_shot(
+                            db, project_id, shot_spec.shot_id,
+                            production.video_path,
+                            expected_duration_s=shot_spec.duration_s,
+                            encoder=self.encoder, events=self.events,
+                        )
+                        production.final = finalization.passed
+                        if not finalization.passed:
+                            result.notes.append(
+                                f"{shot_spec.shot_id} was rendered but did not "
+                                f"verify: {finalization.reason}"
+                            )
+
                     if production.video_path:
                         shot_videos.append(Path(production.video_path))
                     if production.frames_dir:
                         frames_by_shot[shot_spec.shot_id] = Path(production.frames_dir)
+
+                    # Release frames only after the verdict said FINAL.
+                    if finalization is not None and finalization.frames_releasable:
+                        cleanup = self._release_shot_storage(
+                            project_id, shot_spec.shot_id, production.frames_dir
+                        )
+                        if cleanup and cleanup.get("freed_bytes"):
+                            result.notes.append(
+                                f"released {cleanup['freed_gb']:.3f} GB of frames "
+                                f"after {shot_spec.shot_id} was promoted and verified"
+                            )
+
                     director.complete_task(
                         shot_task, approved=production.approved,
                         version=production.version, rounds=production.rounds,
@@ -500,6 +635,9 @@ class Producer:
                 plan.shots, shot_videos, final,
                 frames_by_shot=frames_by_shot,
                 expected_audio=expected_audio,
+                finalized_shots={
+                    s.shot_id for s in result.shots if getattr(s, "final", False)
+                },
             )
             result.qa = qa_report
             db.record_qa(

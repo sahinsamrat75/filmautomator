@@ -27,6 +27,7 @@ from urllib.parse import parse_qs, urlparse
 from . import __version__
 from .config import AppConfig, load_config
 from .core.events import EventBus, EventKind
+from .core.storage import StorageGovernor
 from .runtime import ProductionRunner, RunState
 
 log = logging.getLogger(__name__)
@@ -196,8 +197,26 @@ class DashboardState:
                 "bytes": latest_final["bytes"],
                 "created_at": latest_final["created_at"],
             } if latest_final else None,
+            # The same storage measurement the MCP tool reports, so the
+            # dashboard can never show a different disk story than the AI sees.
+            "storage": self.storage_state(),
             "pending_decisions": pending,
         }
+
+    def storage_state(self) -> dict[str, Any]:
+        """Live working-storage measurement for the dashboard.
+
+        Measured, never estimated: the governor walks the workspace and applies
+        the same safe-cleanup rule production uses.
+        """
+        try:
+            usage = StorageGovernor(
+                self.config.workspace,
+                thresholds=self.config.storage.thresholds(),
+            ).measure()
+        except Exception as exc:  # noqa: BLE001 - the dashboard must still render
+            return {"state": "UNKNOWN", "error": str(exc)}
+        return usage.to_dict()
 
 
 class DashboardServer:
@@ -604,6 +623,13 @@ INDEX_HTML = """<!DOCTYPE html>
     </div>
 
     <div class="panel">
+      <h2>Working storage <span id="st-state" class="sub"></span></h2>
+      <div class="bar"><div class="fill" id="st-fill"></div></div>
+      <div class="sub" id="st-detail" style="margin-top:8px"></div>
+      <ul id="st-cats" style="margin-top:8px"></ul>
+    </div>
+
+    <div class="panel">
       <h2>Artifacts</h2>
       <ul id="artifacts"><li class="muted">none yet</li></ul>
     </div>
@@ -728,6 +754,33 @@ function render(s){
       setTimeout(() => stage.classList.remove("flash"), 1000);
     }
     $("pv-shot").textContent = pv.shot_id || "";
+  }
+
+  // Working storage — the same measurement the MCP tools report.
+  const st = s.storage;
+  if (st) {
+    $("st-state").textContent = st.state || "";
+    const pct = Math.max(0, Math.min(100, st.percent_of_limit || 0));
+    const fill = $("st-fill");
+    fill.style.width = pct + "%";
+    fill.style.background =
+      st.state === "HARD_LIMIT" ? "#e5484d"
+      : st.state === "AGGRESSIVE_CLEANUP" ? "#f5a524"
+      : st.state === "WARNING" ? "#f5d90a" : "#30a46c";
+    $("st-detail").textContent =
+      (st.total_gb || 0).toFixed(2) + " GB of " +
+      ((st.thresholds && st.thresholds.hard_limit_gb) || 35) + " GB (" +
+      pct + "%) · reclaimable now " + (st.disposable_gb || 0).toFixed(2) +
+      " GB · protected " + ((st.protected_bytes || 0) / 1073741824).toFixed(2) +
+      " GB";
+    const cats = Object.entries(st.by_category || {})
+      .filter(([, v]) => v.bytes > 0)
+      .sort((a, b) => b[1].bytes - a[1].bytes);
+    $("st-cats").innerHTML = cats.length
+      ? cats.map(([k, v]) =>
+          `<li><span>${esc(v.label || k)}</span>` +
+          `<span class="muted">${(v.gb || 0).toFixed(3)} GB</span></li>`).join("")
+      : '<li class="muted">nothing on disk yet</li>';
   }
 
   // Artifacts

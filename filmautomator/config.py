@@ -153,11 +153,53 @@ class LimitsConfig:
 
 
 @dataclass(slots=True)
+class StorageConfig:
+    """The working-storage budget for production.
+
+    This is a ceiling on *working* storage — frames, previews, temporaries and
+    other disposable production artifacts. It is not a quota on deliverables:
+    a finalized movie stays on disk no matter how large it is, and no cleanup
+    path will ever remove one to make room.
+
+    Defaults suit a laptop with roughly 80 GB free. The 35 GB ceiling leaves the
+    owner's own files room to exist alongside a production in progress.
+    """
+
+    #: Total working storage Filmautomator may occupy before refusing to start
+    #: another large render.
+    max_working_gb: float = 35.0
+    #: Cross this and the owner is told the disk is filling.
+    warning_gb: float = 25.0
+    #: Cross this and production cleans up disposable artifacts on its own.
+    aggressive_cleanup_gb: float = 30.0
+    #: Refuse to begin a large render once above the limit unless a safe
+    #: cleanup can first free enough room.
+    hard_limit_gb: float = 35.0
+    #: Clean up automatically once the disk enters AGGRESSIVE_CLEANUP.
+    cleanup_enabled: bool = True
+    #: How much space a large render is assumed to need when checking headroom.
+    #: Deliberately conservative: refusing slightly early is harmless, whereas
+    #: starting a render that cannot finish is not.
+    estimated_render_gb: float = 2.0
+
+    def thresholds(self) -> "StorageThresholds":
+        """Build the governor's threshold object from this configuration."""
+        from .core.storage import StorageThresholds
+
+        return StorageThresholds(
+            warning_bytes=int(self.warning_gb * 1024 ** 3),
+            aggressive_bytes=int(self.aggressive_cleanup_gb * 1024 ** 3),
+            hard_limit_bytes=int(self.hard_limit_gb * 1024 ** 3),
+        )
+
+
+@dataclass(slots=True)
 class AppConfig:
     gateway: GatewayConfig = field(default_factory=GatewayConfig)
     blender: BlenderConfig = field(default_factory=BlenderConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
+    storage: StorageConfig = field(default_factory=StorageConfig)
     #: Root directory where projects are written. Each project gets its own
     #: directory tree under here (spec section 9).
     workspace: Path = field(default_factory=lambda: Path.cwd() / "projects")
@@ -182,7 +224,7 @@ def _resolve_workspace(value: str | Path) -> Path:
 
 def _apply_toml(cfg: AppConfig, data: dict) -> None:
     """Overlay a parsed TOML document onto an AppConfig in place."""
-    for section_name in ("gateway", "blender", "render", "limits"):
+    for section_name in ("gateway", "blender", "render", "limits", "storage"):
         section = data.get(section_name)
         if not isinstance(section, dict):
             continue
@@ -222,6 +264,13 @@ def load_config(path: Path | None = None) -> AppConfig:
         cfg.workspace = _resolve_workspace(ws)
     if os.environ.get("FA_ENABLE_EXTERNAL_PROVIDERS") == "1":
         cfg.gateway.enable_external_providers = True
+    # Storage overrides, so an owner can raise the ceiling on a machine with
+    # more room without editing a file.
+    if gb := os.environ.get("FA_STORAGE_MAX_GB"):
+        cfg.storage.hard_limit_gb = float(gb)
+        cfg.storage.max_working_gb = float(gb)
+    if os.environ.get("FA_STORAGE_CLEANUP_DISABLED") == "1":
+        cfg.storage.cleanup_enabled = False
 
     # Always absolute, whichever source supplied it.
     cfg.workspace = _resolve_workspace(cfg.workspace)
