@@ -934,7 +934,20 @@ class ProjectDB:
     def _artifact_row(row: sqlite3.Row) -> dict[str, Any]:
         data = dict(row)
         data["metadata"] = json.loads(data.get("metadata") or "{}")
-        data["exists"] = Path(data["path"]).is_file()
+        # An artifact may be a directory — a rendered frame sequence is one.
+        # Testing is_file() alone reported every directory artifact as missing,
+        # which is both wrong and exactly the kind of false alarm that makes a
+        # real one easy to miss.
+        path = Path(data["path"])
+        if path.is_file():
+            data["exists"] = True
+            data["artifact_type"] = "file"
+        elif path.is_dir():
+            data["exists"] = True
+            data["artifact_type"] = "directory"
+        else:
+            data["exists"] = False
+            data["artifact_type"] = "missing"
         return data
 
     def list_artifacts(self, project_id: str, kind: str | None = None,

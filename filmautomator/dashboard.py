@@ -93,46 +93,19 @@ class DashboardState:
     def run_state(self, project_id: str) -> dict[str, Any]:
         """The authoritative run state, from whichever process owns it.
 
-        The dashboard and the MCP server are separate processes, so a run
-        started by an AI client is invisible to this process's runner. Reading
-        the persisted row is what stops the dashboard reporting IDLE while a
-        film is actually being rendered elsewhere.
+        Delegates to the runner, which reconciles a stored COMPLETED against the
+        filesystem. The dashboard and the MCP server are separate processes, so
+        a run started by an AI client is invisible to this process's runner —
+        reading and verifying the persisted row is what stops the dashboard
+        reporting success for a film that is no longer on disk.
         """
-        in_process = self.runner.status()
-        if in_process.get("active") or (
-            self.runner.run and self.runner.run.project_id == project_id
-        ):
-            return in_process
-
-        try:
-            stored = self.db.get_run(project_id)
-        except Exception:  # noqa: BLE001
-            stored = None
-
-        if not stored:
-            return in_process
-
-        started = stored.get("started_at", "")
-        finished = stored.get("finished_at", "")
-        return {
-            "project_id": stored["project_id"],
-            "objective": stored.get("objective", ""),
-            "state": stored.get("state", "IDLE"),
-            "active": stored.get("state") in {"RUNNING", "PAUSED", "STOPPING"},
-            "current_stage": stored.get("stage", ""),
-            "current_shot": stored.get("current_shot", ""),
-            "shots_total": stored.get("shots_total", 0),
-            "shots_done": stored.get("shots_done", 0),
-            "percent": stored.get("percent", 0.0),
-            "error": stored.get("error", ""),
-            "started_at": started,
-            "finished_at": finished,
-            "elapsed": _elapsed(started, finished),
-            "activity": self.events.current_activity(project_id),
-            # Tells the UI (and the owner) that control has to travel through
-            # storage to reach the process doing the work.
-            "managed_elsewhere": True,
-        }
+        state = self.runner.status(project_id)
+        if state.get("state") == "IDLE" and not state.get("note"):
+            in_process = self.runner.status()
+            if in_process.get("active"):
+                return in_process
+        state.setdefault("managed_elsewhere", True)
+        return state
 
     def snapshot(self, project_id: str = "") -> dict[str, Any]:
         """Everything the dashboard needs in one response."""

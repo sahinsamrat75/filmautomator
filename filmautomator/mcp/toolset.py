@@ -22,6 +22,7 @@ from typing import Any
 from ..agents import AgentContext, BlenderAgent, VisionAgent
 from ..agents.director import Director
 from ..core.events import EventKind
+from ..core.integrity import verify_project
 from ..core.spec import ShotSpec
 from ..core.task import QAStatus, Task, TaskStatus
 from ..core.workspace import Workspace
@@ -303,9 +304,14 @@ def tool_stop_production(ctx: ToolContext, args: dict) -> dict:
 
 @tool("get_production_status",
       "Current production state: run state, progress, current shot and stage, "
-      "and what the agents are doing right now.")
+      "and what the agents are doing right now. Pass a project_id to ask about "
+      "a project rather than the live run; the answer is re-checked against the "
+      "files on disk, so COMPLETED means the film is there now.",
+      properties={"project_id": {"type": "string",
+                                 "description": "Optional. Report this project "
+                                                "instead of the live run."}})
 def tool_get_production_status(ctx: ToolContext, args: dict) -> dict:
-    return ok(ctx.runner.status())
+    return ok(ctx.runner.status(require_str(args, "project_id")))
 
 
 # ===========================================================================
@@ -977,7 +983,8 @@ def tool_get_visual_evaluation(ctx: ToolContext, args: dict) -> dict:
 
 
 @tool("list_artifacts",
-      "Everything a project has produced: previews, renders, videos, reports.",
+      "Everything a project has produced: previews, renders, videos, reports. "
+      "Each entry reports whether the file is actually present on disk.",
       properties={"project_id": {"type": "string"},
                   "kind": {"type": "string",
                            "description": "preview, render, shot_video, "
@@ -992,7 +999,14 @@ def tool_list_artifacts(ctx: ToolContext, args: dict) -> dict:
         return ok({"artifacts": [], "count": 0})
     kind = require_str(args, "kind") or None
     artifacts = ctx.db.list_artifacts(project_id, kind)
-    return ok({"artifacts": artifacts, "count": len(artifacts)})
+    missing = [a for a in artifacts if not a["exists"]]
+    return ok({
+        "artifacts": artifacts,
+        "count": len(artifacts),
+        "missing": len(missing),
+        "note": (f"{len(missing)} registered artifact(s) are no longer on disk"
+                 if missing else "every registered artifact is present"),
+    })
 
 
 @tool("get_artifact", "One artifact by id.",
@@ -1048,7 +1062,8 @@ def tool_get_render(ctx: ToolContext, args: dict) -> dict:
 
 @tool("get_final_movie",
       "The finished film: path, duration, resolution, frame rate and codec. "
-      "This is the deliverable.",
+      "The file is verified on disk and probed before this returns, so a path "
+      "from here is one that exists.",
       properties={"project_id": {"type": "string"}})
 def tool_get_final_movie(ctx: ToolContext, args: dict) -> dict:
     project_id = require_str(args, "project_id")
@@ -1060,9 +1075,14 @@ def tool_get_final_movie(ctx: ToolContext, args: dict) -> dict:
 
     artifact = ctx.db.latest_artifact(project_id, "final_movie")
     if artifact is None or not Path(artifact["path"]).is_file():
+        integrity = verify_project(ctx.db, project_id, encoder=VideoEncoder(),
+                                   probe_final=False)
         return fail(
-            "this project has no finished movie yet. Check "
-            "get_production_status — production may still be running."
+            "this project has no finished movie on disk"
+            + (f" — {integrity.summary}" if integrity.problems else "")
+            + ". Check get_production_status; the run may have been marked "
+              "COMPLETED before its output went missing.",
+            detail=integrity.to_dict() if integrity.problems else None,
         )
 
     encoder = VideoEncoder()
@@ -1076,9 +1096,13 @@ def tool_get_final_movie(ctx: ToolContext, args: dict) -> dict:
             "codec": probe.video_codec,
             "has_audio": probe.has_audio,
             "size_mb": round(Path(artifact["path"]).stat().st_size / 1e6, 2),
+            "verified": True,
         }
     except FFmpegError as exc:
-        info = {"probe_error": str(exc)}
+        return fail(
+            f"the final movie exists but does not probe as valid video: {exc}",
+            detail={"path": artifact["path"]},
+        )
 
     project = ctx.db.get_project(project_id) or {}
     return ok({
@@ -1224,16 +1248,36 @@ def tool_run_qa(ctx: ToolContext, args: dict) -> dict:
     return ok({"report_path": str(path), **report.to_dict()})
 
 
-@tool("get_qa_status", "Latest QA verdict for a project.",
+@tool("get_qa_status",
+      "Latest QA verdict for a project, re-checked against the files on disk.",
       properties={"project_id": {"type": "string"}})
 def tool_get_qa_status(ctx: ToolContext, args: dict) -> dict:
     project_id = require_str(args, "project_id")
     record = ctx.db.latest_qa(project_id, project_id, "final")
+    integrity = verify_project(ctx.db, project_id, encoder=VideoEncoder())
+
     if record is None:
-        return ok({"project_id": project_id, "status": "UNREVIEWED"})
-    return ok({"project_id": project_id, "status": record["status"],
-               "score": record["score"], "at": record["created_at"],
-               "failures": record["findings"]})
+        return ok({"project_id": project_id, "status": "UNREVIEWED",
+                   "integrity": integrity.to_dict()})
+
+    payload = {
+        "project_id": project_id,
+        "status": record["status"],
+        "score": record["score"],
+        "at": record["created_at"],
+        "failures": record["findings"],
+        "integrity": integrity.to_dict(),
+    }
+    # A recorded PASS describes the moment it ran. If the output is gone now,
+    # saying PASSED would be repeating a claim the filesystem contradicts.
+    if record["status"] == "PASSED" and not integrity.ok:
+        payload["status"] = "FAILED"
+        payload["recorded_status"] = "PASSED"
+        payload["note"] = (
+            "QA recorded a pass, but the output it checked is no longer on "
+            f"disk: {integrity.summary}"
+        )
+    return ok(payload)
 
 
 @tool("get_qa_report", "The full stored QA report for a project.",

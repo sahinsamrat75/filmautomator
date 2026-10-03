@@ -171,6 +171,95 @@ def test_full_production_through_mcp(server: MCPServer):
         assert expected in event_kinds, f"{expected} missing from {sorted(event_kinds)}"
 
 
+def test_a_production_whose_output_vanishes_stops_claiming_success(server: MCPServer,
+                                                                  tmp_path: Path):
+    """Reproduces the reported bug, end to end.
+
+    A real production completes and verifies. Then its final movie is removed —
+    the way a moved folder or a stray cleanup would. The system must stop
+    reporting success, in every surface that reports it, rather than repeating
+    a claim the filesystem now contradicts.
+    """
+    created = payload(server, "create_project", {
+        "name": "VANISH", "objective": "a short scene", "duration_s": DURATION_S,
+    })
+    project_id = created["project_id"]
+    payload(server, "start_production", {
+        "project_id": project_id, "duration_s": DURATION_S, "offline": True,
+        "engine": "BLENDER_EEVEE", "width": WIDTH, "height": HEIGHT,
+    })
+    assert wait_for_completion(server)["state"] == "COMPLETED"
+
+    movie = payload(server, "get_final_movie", {"project_id": project_id})
+    final_path = Path(movie["final_movie"])
+    assert final_path.is_file()
+
+    # Everything is genuinely fine at this point.
+    assert payload(server, "get_production_status")["state"] == "COMPLETED"
+    assert payload(server, "get_qa_status",
+                   {"project_id": project_id})["status"] == "PASSED"
+
+    # Now the output disappears.
+    final_path.unlink()
+
+    status = payload(server, "get_production_status")
+    assert status["state"] == "FAILED", status
+    assert status["integrity"]["ok"] is False
+
+    # QA must not keep reporting a pass it can no longer stand behind.
+    qa = payload(server, "get_qa_status", {"project_id": project_id})
+    assert qa["status"] == "FAILED", qa
+    assert qa["recorded_status"] == "PASSED"   # honest about what it once saw
+
+    # The deliverable must not be handed out as if it were there.
+    missing = call(server, "get_final_movie", {"project_id": project_id})
+    assert missing.get("isError") is True
+    assert "no finished movie" in missing["content"][0]["text"]
+
+    # And the artifact registry must say so plainly.
+    artifacts = payload(server, "list_artifacts", {"project_id": project_id})
+    assert artifacts["missing"] >= 1
+    final_rows = [a for a in artifacts["artifacts"] if a["kind"] == "final_movie"]
+    assert final_rows and final_rows[0]["exists"] is False
+
+
+def test_a_healthy_production_reports_verified_integrity(server: MCPServer):
+    """The counterexample: a normal run must positively verify, not merely
+    avoid failing."""
+    created = payload(server, "create_project", {
+        "name": "HEALTHY", "objective": "a short scene", "duration_s": DURATION_S,
+    })
+    project_id = created["project_id"]
+    payload(server, "start_production", {
+        "project_id": project_id, "duration_s": DURATION_S, "offline": True,
+        "engine": "BLENDER_EEVEE", "width": WIDTH, "height": HEIGHT,
+    })
+    status = wait_for_completion(server)
+    assert status["state"] == "COMPLETED", status
+    assert status["integrity"]["ok"] is True
+    assert status["integrity"]["checked"] > 0
+    assert status["integrity"]["final_movie_bytes"] > 0
+    assert Path(status["integrity"]["final_movie"]).is_file()
+
+    # Status polls use a cheap existence check; the full ffprobe happens when
+    # the deliverable is actually fetched.
+    movie = payload(server, "get_final_movie", {"project_id": project_id})
+    assert movie["verified"] is True
+    assert movie["codec"] == "h264"
+    assert movie["resolution"] == f"{WIDTH}x{HEIGHT}"
+    assert movie["size_mb"] > 0
+
+    # Every registered artifact must be present — this is the invariant the
+    # original bug violated.
+    artifacts = payload(server, "list_artifacts", {"project_id": project_id})
+    assert artifacts["missing"] == 0, artifacts["artifacts"]
+
+    # The report the production wrote must itself exist.
+    assert Path(status.get("integrity", {}).get("final_movie", "")).is_file()
+    reports = [a for a in artifacts["artifacts"] if a["kind"] == "report"]
+    assert reports and reports[0]["exists"] is True
+
+
 def test_production_can_be_stopped_mid_flight(server: MCPServer):
     """A long production must be interruptible without corrupting anything."""
     created = payload(server, "create_project", {

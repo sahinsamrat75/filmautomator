@@ -31,6 +31,7 @@ from .agents import AgentContext, BlenderAgent, Director, PlanResult, ShotProduc
 from .blender.session import BlenderSession, BlenderUnavailable
 from .config import AppConfig, find_blender, load_config
 from .core.events import EventBus, EventKind
+from .core.integrity import verify_project
 from .core.project import ProjectDB
 from .core.spec import ShotSpec
 from .core.task import QAStatus, Task, TaskStatus
@@ -84,6 +85,8 @@ class ProductionResult:
     shots: list[ShotProduction] = field(default_factory=list)
     final_video: str = ""
     qa: QAReport | None = None
+    #: Filesystem verification of the output, run before success was decided.
+    integrity: Any = None
     report_path: str = ""
     error: str = ""
     notes: list[str] = field(default_factory=list)
@@ -247,9 +250,15 @@ class Producer:
 
         self.announce(f"project {project_id} created at {self._workspace.root}")
         self.events.emit(
-            project_id, EventKind.PROJECT_CREATED,
-            f"Project {name!r} created",
-            payload={"name": name, "objective": request.objective,
+            project_id,
+            # Only announce creation when this run actually created it. Reusing
+            # an existing project used to emit a second "created" event, which
+            # made the history claim the project was made twice.
+            EventKind.PROJECT_CREATED if existing is None
+            else EventKind.PRODUCTION_STARTED,
+            (f"Project {name!r} created" if existing is None
+             else f"Producing into existing project {name!r}"),
+            payload={"name": name, "objective": objective,
                      "workspace": str(self._workspace.root)},
         )
 
@@ -507,12 +516,6 @@ class Producer:
                     item,
                 )
 
-            result.success = qa_report.passed
-            if not qa_report.passed:
-                result.notes.append(
-                    f"{len(qa_report.failures)} QA check(s) failed; "
-                    "corrective tasks were logged."
-                )
             qa_report_path = workspace.qa_report()
             qa_report_path.write_text(
                 json.dumps(qa_report.to_dict(), indent=2), encoding="utf-8"
@@ -529,17 +532,48 @@ class Producer:
                 payload={"report": qa_report.to_dict()},
             )
 
+            # The production report is written BEFORE success is decided, and
+            # is itself part of what gets verified. Deciding first and writing
+            # afterwards is how a production could be called complete while its
+            # own report was missing.
             result.report_path = str(self._write_report(result, project_id))
+
+            # Verify against the filesystem rather than the database. Everything
+            # above *registered* paths; this is the only step that proves the
+            # files exist, are non-empty, and that the deliverable is real video.
+            integrity = verify_project(db, project_id, encoder=self.encoder)
+            result.integrity = integrity
+            problems = [p.render() for p in integrity.problems]
+
+            result.success = qa_report.passed and integrity.ok
+            if not qa_report.passed:
+                result.notes.append(
+                    f"{len(qa_report.failures)} QA check(s) failed; "
+                    "corrective tasks were logged."
+                )
+            if not integrity.ok:
+                result.error = (
+                    "production did not produce verifiable output: "
+                    + "; ".join(problems)
+                )
+            result.notes.append(f"artifact integrity: {integrity.summary}")
+
+            if result.success:
+                headline = f"Production complete — {final.name}"
+            elif problems:
+                headline = f"Production FAILED verification: {problems[0]}"
+            else:
+                headline = "Production finished with QA failures"
+
             bus.emit(
                 project_id,
                 EventKind.PRODUCTION_COMPLETED if result.success
                 else EventKind.PRODUCTION_FAILED,
-                (f"Production complete — {final.name}"
-                 if result.success else "Production finished with QA failures"),
+                headline,
                 agent="director",
                 payload={"final_movie": str(final),
-                         "duration_s": getattr(qa_report, "duration_s", 0.0) or 0.0,
-                         "success": result.success},
+                         "success": result.success,
+                         "integrity": integrity.to_dict()},
             )
             return result
 

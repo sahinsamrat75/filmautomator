@@ -272,6 +272,64 @@ def test_production_status_is_idle_before_anything_runs(server: MCPServer):
     assert status["active"] is False
 
 
+def test_production_status_can_be_asked_about_a_finished_project(server: MCPServer):
+    """Without this the tool only ever described the live run, so an AI asking
+    about a project from an earlier session got IDLE — and no verification."""
+    created = tool_payload(server, "create_project", {"name": "Film"})
+    project_id = created["project_id"]
+    db = server.context.db
+    db.upsert_run(project_id, state="COMPLETED", percent=100.0,
+                  started_at="2026-01-01T00:00:00+00:00",
+                  finished_at="2026-01-01T00:00:05+00:00")
+
+    payload = tool_payload(server, "get_production_status",
+                           {"project_id": project_id})
+    assert payload["project_id"] == project_id
+    # Registered nothing, so there is no output to stand behind.
+    assert payload["state"] == "FAILED", payload
+    assert payload["integrity"]["ok"] is False
+
+
+def test_production_status_keeps_completed_when_output_is_present(server: MCPServer,
+                                                                tmp_path: Path):
+    from filmautomator.core.integrity import REQUIRED_KINDS
+
+    created = tool_payload(server, "create_project", {"name": "Film"})
+    project_id = created["project_id"]
+    db = server.context.db
+    for kind in REQUIRED_KINDS:
+        target = tmp_path / f"{kind}.bin"
+        target.write_bytes(b"x" * 64)
+        db.register_artifact(project_id, kind, str(target), kind)
+    db.upsert_run(project_id, state="COMPLETED", percent=100.0,
+                  started_at="2026-01-01T00:00:00+00:00",
+                  finished_at="2026-01-01T00:00:05+00:00")
+
+    payload = tool_payload(server, "get_production_status",
+                           {"project_id": project_id})
+    assert payload["state"] == "COMPLETED", payload
+    assert payload["integrity"]["ok"] is True
+
+
+def test_list_artifacts_reports_how_many_are_actually_missing(server: MCPServer,
+                                                              tmp_path: Path):
+    created = tool_payload(server, "create_project", {"name": "Film"})
+    project_id = created["project_id"]
+    db = server.context.db
+    present = tmp_path / "here.png"
+    present.write_bytes(b"x")
+    gone = tmp_path / "gone.png"
+    gone.write_bytes(b"x")
+    db.register_artifact(project_id, "preview", str(present))
+    db.register_artifact(project_id, "preview", str(gone))
+    gone.unlink()
+
+    payload = tool_payload(server, "list_artifacts", {"project_id": project_id})
+    assert payload["count"] == 2
+    assert payload["missing"] == 1
+    assert "no longer on disk" in payload["note"]
+
+
 def test_control_tools_report_that_nothing_was_running(server: MCPServer):
     assert tool_payload(server, "pause")["paused"] is False
     assert tool_payload(server, "resume")["resumed"] is False

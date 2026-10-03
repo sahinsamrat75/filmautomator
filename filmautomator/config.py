@@ -167,6 +167,19 @@ class AppConfig:
     mcp_http_port: int = 0
 
 
+def _resolve_workspace(value: str | Path) -> Path:
+    """Make a workspace path absolute and normalised.
+
+    Everything downstream derives from this — the project root, the registry,
+    every artifact path. Leaving it relative means the same configuration
+    produces different absolute paths depending on each process's working
+    directory, so the MCP server (launched by a GUI host with an arbitrary cwd)
+    and the CLI can disagree about where a project lives. Resolving once, here,
+    is what keeps them identical.
+    """
+    return Path(value).expanduser().resolve()
+
+
 def _apply_toml(cfg: AppConfig, data: dict) -> None:
     """Overlay a parsed TOML document onto an AppConfig in place."""
     for section_name in ("gateway", "blender", "render", "limits"):
@@ -181,7 +194,7 @@ def _apply_toml(cfg: AppConfig, data: dict) -> None:
                 value = Path(str(value)).expanduser()
             setattr(target, key, value)
     if "workspace" in data:
-        cfg.workspace = Path(str(data["workspace"])).expanduser()
+        cfg.workspace = _resolve_workspace(str(data["workspace"]))
 
 
 def load_config(path: Path | None = None) -> AppConfig:
@@ -206,9 +219,12 @@ def load_config(path: Path | None = None) -> AppConfig:
     if key := os.environ.get("FA_MODEL_API_KEY"):
         cfg.gateway.openai_compat_api_key = key
     if ws := os.environ.get("FA_WORKSPACE"):
-        cfg.workspace = Path(ws).expanduser()
+        cfg.workspace = _resolve_workspace(ws)
     if os.environ.get("FA_ENABLE_EXTERNAL_PROVIDERS") == "1":
         cfg.gateway.enable_external_providers = True
+
+    # Always absolute, whichever source supplied it.
+    cfg.workspace = _resolve_workspace(cfg.workspace)
 
     if cfg.blender.executable is None:
         cfg.blender.executable = find_blender()

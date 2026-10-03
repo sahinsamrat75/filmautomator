@@ -61,6 +61,19 @@ def post(port: int, path: str, payload: dict) -> tuple[int, dict]:
         return exc.code, json.loads(exc.read().decode("utf-8"))
 
 
+def _register_complete_output(db, project_id: str, tmp_path: Path) -> list[str]:
+    """Register a full, present set of artifacts — what a good run leaves."""
+    from filmautomator.core.integrity import REQUIRED_KINDS
+
+    paths = []
+    for kind in REQUIRED_KINDS:
+        target = tmp_path / f"{kind}.bin"
+        target.write_bytes(b"x" * 128)
+        db.register_artifact(project_id, kind, str(target), f"{kind} output")
+        paths.append(str(target))
+    return paths
+
+
 # -- the page --------------------------------------------------------------
 
 
@@ -268,16 +281,45 @@ def test_dashboard_sees_a_run_owned_by_another_process(dashboard):
     assert run["managed_elsewhere"] is True
 
 
-def test_dashboard_reports_a_finished_run_from_another_process(dashboard):
+def test_a_completed_run_with_its_output_verifies_as_complete(dashboard, tmp_path):
     server, _, _, port = dashboard
     db = server._db_handle()  # noqa: SLF001
     project_id = db.create_project("Elsewhere", "")
+    _register_complete_output(db, project_id, tmp_path)
     db.upsert_run(project_id, state="COMPLETED", percent=100.0,
                   finished_at="2026-01-01T00:00:10+00:00",
                   started_at="2026-01-01T00:00:00+00:00")
+
     _, payload = get_json(port, "/api/state")
     assert payload["run"]["state"] == "COMPLETED"
     assert payload["run"]["active"] is False
+    assert payload["run"]["integrity"]["ok"] is True
+
+
+def test_a_completed_run_whose_output_vanished_reports_failed(dashboard, tmp_path):
+    """The exact bug: the database said COMPLETED, the files were gone, and the
+    dashboard repeated the claim. Completion now has to survive a filesystem
+    check on every read."""
+    server, _, _, port = dashboard
+    db = server._db_handle()  # noqa: SLF001
+    project_id = db.create_project("Elsewhere", "")
+    paths = _register_complete_output(db, project_id, tmp_path)
+    db.upsert_run(project_id, state="COMPLETED", percent=100.0,
+                  started_at="2026-01-01T00:00:00+00:00",
+                  finished_at="2026-01-01T00:00:10+00:00")
+
+    # Everything looked fine a moment ago.
+    assert get_json(port, "/api/state")[1]["run"]["state"] == "COMPLETED"
+
+    for path in paths:
+        Path(path).unlink()
+
+    _, payload = get_json(port, "/api/state")
+    assert payload["run"]["state"] == "FAILED", payload["run"]
+    assert payload["run"]["integrity"]["ok"] is False
+    assert "no longer on disk" in payload["run"]["error"]
+    # And it must not silently keep claiming success to the next reader.
+    assert db.get_run(project_id)["state"] == "FAILED"
 
 
 def test_control_for_another_process_is_queued_not_dropped(dashboard):

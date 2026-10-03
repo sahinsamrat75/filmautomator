@@ -24,6 +24,7 @@ from typing import Any
 
 from .config import AppConfig, load_config
 from .core.events import EventBus, EventKind
+from .core.integrity import verify_project
 from .core.project import ProjectDB
 from .producer import DependencyMissing, Producer, ProductionRequest, ProductionResult
 
@@ -32,6 +33,89 @@ log = logging.getLogger(__name__)
 
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _elapsed_between(started_at: str, finished_at: str = "") -> str:
+    """Human elapsed time between two ISO timestamps."""
+    if not started_at:
+        return ""
+    try:
+        start = datetime.fromisoformat(started_at)
+        end = (datetime.fromisoformat(finished_at) if finished_at
+               else datetime.now(timezone.utc))
+    except ValueError:
+        return ""
+    seconds = max(0.0, (end - start).total_seconds())
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    minutes, secs = divmod(int(seconds), 60)
+    if minutes < 60:
+        return f"{minutes}m {secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes:02d}m"
+
+
+def revoke_completed_run(db: Any, events: EventBus | None, project_id: str,
+                         integrity: dict[str, Any]) -> str:
+    """Downgrade a COMPLETED run whose output is gone, and persist it.
+
+    Persisting matters: reporting FAILED from one reader while the row still
+    says COMPLETED means the next reader — another process, the dashboard, a
+    later session — gets the false answer all over again. Returns the message
+    written, or "" if there was nothing to revoke.
+    """
+    try:
+        stored = db.get_run(project_id)
+    except Exception:  # noqa: BLE001
+        return ""
+    if not stored or stored.get("state") != RunState.COMPLETED.value:
+        return ""
+
+    first = integrity["problems"][0] if integrity.get("problems") else {}
+    message = (
+        "production previously reported COMPLETED but its output is no longer "
+        f"on disk: {first.get('detail', 'missing artifacts')} "
+        f"({first.get('path', '')})"
+    )
+    try:
+        db.upsert_run(project_id, state=RunState.FAILED.value, stage="output missing",
+                      error=message)
+    except Exception:  # noqa: BLE001
+        log.debug("could not persist revocation for %s", project_id, exc_info=True)
+
+    if events is not None:
+        try:
+            events.emit(project_id, EventKind.PRODUCTION_FAILED, message,
+                        agent="final_qa",
+                        payload={"integrity": integrity, "revoked": True})
+        except Exception:  # noqa: BLE001
+            pass
+    return message
+
+
+def verify_run_integrity(db: Any, project_id: str, state: str,
+                         encoder: Any = None) -> dict[str, Any] | None:
+    """Re-check a finished run's output against the filesystem.
+
+    Completion is decided once, when the production ends. Nothing guarantees
+    the files are still there afterwards — a moved folder, a cleanup tool, or a
+    mistaken delete all leave the database happily claiming success. Any read
+    of run state therefore re-verifies, so ``COMPLETED`` means "the movie is on
+    disk right now", not "it was, briefly, at 18:25".
+
+    Existence only, no ffprobe: this runs on every status read and the question
+    it answers is "is the output still there?". Whether the file is valid video
+    was checked at completion and is checked again by ``get_final_movie`` when
+    the deliverable is actually fetched.
+    """
+    if state != RunState.COMPLETED.value or not project_id:
+        return None
+    try:
+        return verify_project(db, project_id, encoder=encoder,
+                              probe_final=False).to_dict()
+    except Exception:  # noqa: BLE001 - verification must never break status reads
+        log.debug("integrity check failed for %s", project_id, exc_info=True)
+        return None
 
 
 class RunState(str, Enum):
@@ -256,15 +340,90 @@ class ProductionRunner:
         with self._lock:
             return self._run is not None and self._run.is_active
 
-    def status(self) -> dict[str, Any]:
+    def status(self, project_id: str = "") -> dict[str, Any]:
+        """Run state for the live production, or for a named project.
+
+        Without a project id this reports whatever is running now. With one it
+        reports that project's recorded state — reconciled against the
+        filesystem, so a project whose output has gone missing is not still
+        described as COMPLETED just because it once was.
+        """
         with self._lock:
             run = self._run
+            if project_id and (run is None or run.project_id != project_id):
+                return self._status_from_store(project_id)
             if run is None:
                 return {"state": RunState.IDLE.value, "active": False}
             data = run.to_dict()
             data["active"] = run.is_active
             data["activity"] = self.events.current_activity(run.project_id)
+
+            if run.state is RunState.COMPLETED and run.project_id:
+                integrity = verify_run_integrity(
+                    self.db(), run.project_id, run.state.value
+                )
+                if integrity is not None:
+                    data["integrity"] = integrity
+                    if not integrity["ok"]:
+                        self._revoke(run, integrity)
+                        data["state"] = RunState.FAILED.value
+                        data["success_revoked"] = True
+                        data["error"] = run.error
             return data
+
+    def _status_from_store(self, project_id: str) -> dict[str, Any]:
+        """Status for a project this process is not currently running."""
+        try:
+            stored = self.db().get_run(project_id)
+        except Exception:  # noqa: BLE001
+            stored = None
+
+        if not stored:
+            return {
+                "project_id": project_id, "state": RunState.IDLE.value,
+                "active": False,
+                "note": "no production has been run for this project",
+            }
+
+        state = stored.get("state", RunState.IDLE.value)
+        integrity = verify_run_integrity(self.db(), project_id, state)
+        if integrity is not None and not integrity["ok"]:
+            revoke_completed_run(self.db(), self.events, project_id, integrity)
+            stored = self.db().get_run(project_id) or stored
+            state = stored.get("state", RunState.FAILED.value)
+
+        started = stored.get("started_at", "")
+        finished = stored.get("finished_at", "")
+        return {
+            "project_id": project_id,
+            "objective": stored.get("objective", ""),
+            "state": state,
+            "active": state in {RunState.RUNNING.value, RunState.PAUSED.value,
+                                RunState.STOPPING.value},
+            "current_stage": stored.get("stage", ""),
+            "current_shot": stored.get("current_shot", ""),
+            "shots_total": stored.get("shots_total", 0),
+            "shots_done": stored.get("shots_done", 0),
+            "percent": stored.get("percent", 0.0),
+            "error": stored.get("error", ""),
+            "started_at": started,
+            "finished_at": finished,
+            "elapsed": _elapsed_between(started, finished),
+            "activity": self.events.current_activity(project_id),
+            "integrity": integrity,
+        }
+
+    def _revoke(self, run: ProductionRun, integrity: dict[str, Any]) -> None:
+        """Downgrade a COMPLETED run whose output no longer exists."""
+        if run.state is RunState.FAILED:
+            return  # already revoked; do not spam the event log
+        run.state = RunState.FAILED
+        run.current_stage = "output missing"
+        run.error = revoke_completed_run(
+            self.db(), self.events, run.project_id, integrity
+        ) or "production output is no longer on disk"
+        log.warning("revoking COMPLETED for %s: %s", run.project_id, run.error)
+        self._persist(run)
 
     # -- control -----------------------------------------------------------
 
