@@ -1,0 +1,77 @@
+# FilmAutomator configuration
+#
+# Every value here also has an environment-variable override, so you can keep
+# this file for structure and put machine-specific values in your shell:
+#
+#   FA_BLENDER_PATH      path to the Blender binary
+#   FA_FFMPEG_PATH       path to ffmpeg
+#   FA_FFPROBE_PATH      path to ffprobe
+#   FA_MODEL_BASE_URL    OpenAI-compatible endpoint (default: LM Studio)
+#   FA_MODEL_API_KEY     key for that endpoint (LM Studio ignores the value)
+#   FA_WORKSPACE         where production runs are written
+#   FA_CONFIG            path to this file
+#
+# Copy to `filmautomator.toml` to activate.
+
+workspace = "runs"
+
+[gateway]
+# LM Studio serves an OpenAI-compatible API on this port by default.
+openai_compat_base_url = "http://127.0.0.1:1234/v1"
+openai_compat_api_key = "not-needed"
+openai_compat_timeout_s = 300.0
+
+# Pin a specific model per capability. Leave empty to let the gateway pick —
+# it selects a vision-capable model for `vision` by name and any instruct
+# model for text work.
+[gateway.models]
+# reasoning = "qwen2.5-7b-instruct"
+# planning  = "qwen2.5-7b-instruct"
+# coding    = "qwen2.5-coder-7b-instruct"
+# vision    = "qwen2-vl-7b-instruct"
+
+# Paid or external providers stay off unless you deliberately enable them.
+enable_external_providers = false
+
+# If no local model can serve a request, fall back to a deterministic
+# stand-in rather than failing the task. Synthetic output is always labelled.
+allow_mock_fallback = true
+
+[blender]
+# Leave unset to auto-detect (checks /Applications/Blender.app, then PATH).
+# executable = "/Applications/Blender.app/Contents/MacOS/Blender"
+control_port = 0          # 0 = pick a free port
+startup_timeout_s = 120.0
+op_timeout_s = 900.0
+
+[render]
+# Previews use EEVEE, not the faster Workbench, on purpose: the preview exists
+# so the Vision Agent can judge exposure and lighting, and Workbench renders
+# with its own flat studio lighting that bears no relation to the scene's
+# actual lights. A fast preview that cannot be trusted about lighting makes the
+# correction loop meaningless.
+#
+# Engine names differ across Blender versions (5.x has BLENDER_EEVEE; 4.2-4.5
+# had BLENDER_EEVEE_NEXT). The name you set here is resolved at runtime against
+# a fallback chain, so an unavailable engine degrades instead of failing.
+preview_engine = "BLENDER_EEVEE"
+preview_samples = 16
+preview_width = 480
+preview_height = 270
+
+# Final renders default to Cycles on CPU. On Apple Silicon, cycles_device =
+# "METAL" is a large speedup. EEVEE is several times faster again and is a
+# reasonable choice for draft deliveries.
+final_engine = "CYCLES"
+cycles_device = "CPU"
+final_samples = 64
+final_width = 1280
+final_height = 720
+fps = 24
+
+[limits]
+# Spec section 6 requires an iteration cap so the revision loop cannot spin
+# forever. This is the number of build/preview/inspect rounds per shot.
+max_shot_revision_rounds = 4
+max_task_retries = 3
+max_agent_calls_per_task = 40

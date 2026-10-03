@@ -1,0 +1,91 @@
+{
+  "title": "Night Street",
+  "logline": "A lone figure waits in the rain, then turns toward a sound.",
+  "_comment": "Example owner-supplied shot plan. Use with: filmautomator make \"...\" --plan examples/night_street.json. Any field may be omitted; ShotSpec fills in defaults. Lighting moods: natural, golden_hour, blue_hour, overcast, harsh_noon, moonlight, candlelit, neon, firelight, high_key, low_key, silhouette. Shot sizes: extreme_wide, wide, full, medium_wide, medium, medium_close, close_up, extreme_close_up. Angles: eye_level, low, high, birds_eye, worms_eye, dutch, over_shoulder. Locations are [x, y, z] metres; the camera sits at negative y looking toward the subject.",
+  "shots": [
+    {
+      "shot_id": "SC01_SH01",
+      "scene_id": "SC01",
+      "duration_s": 3.0,
+      "description": "Wide establishing shot: a lone figure stands under a street lamp in heavy rain.",
+      "dramatic_purpose": "Establish isolation and place.",
+      "camera": {
+        "shot_size": "wide",
+        "angle": "eye_level",
+        "movement": "static",
+        "lens_mm": 28
+      },
+      "lighting": { "mood": "moonlight" },
+      "environment": "rain-soaked street at night",
+      "subjects": [
+        {
+          "name": "Figure",
+          "height_m": 1.75,
+          "location": [0.0, 0.0, 0.0],
+          "action": "standing still, shoulders hunched against the rain"
+        }
+      ],
+      "quality_criteria": [
+        "The figure is small in frame but clearly readable as a person.",
+        "The frame reads as night: dark overall but not crushed to black.",
+        "The figure separates from the background rather than merging with it."
+      ]
+    },
+    {
+      "shot_id": "SC01_SH02",
+      "scene_id": "SC01",
+      "duration_s": 3.0,
+      "description": "Medium shot from a low angle as the figure slowly raises their head.",
+      "dramatic_purpose": "Shift from place to character; build unease.",
+      "camera": {
+        "shot_size": "medium",
+        "angle": "low",
+        "movement": "static",
+        "lens_mm": 50
+      },
+      "lighting": { "mood": "low_key" },
+      "environment": "rain-soaked street at night",
+      "subjects": [
+        {
+          "name": "Figure",
+          "height_m": 1.75,
+          "location": [0.0, 0.0, 0.0],
+          "action": "raises head slowly"
+        }
+      ],
+      "quality_criteria": [
+        "The figure occupies roughly a medium-shot fraction of the frame.",
+        "There is strong separation between the lit side and the shadow side.",
+        "The frame is dark in mood but the subject is still clearly visible."
+      ]
+    },
+    {
+      "shot_id": "SC01_SH03",
+      "scene_id": "SC01",
+      "duration_s": 2.5,
+      "description": "Tight shot on the figure silhouetted against the lamp glow as they turn.",
+      "dramatic_purpose": "Punctuate the turn; end on threat.",
+      "camera": {
+        "shot_size": "close_up",
+        "angle": "eye_level",
+        "movement": "static",
+        "lens_mm": 85
+      },
+      "lighting": { "mood": "silhouette" },
+      "environment": "rain-soaked street at night",
+      "subjects": [
+        {
+          "name": "Figure",
+          "height_m": 1.75,
+          "location": [0.0, 0.0, 0.0],
+          "action": "turns toward camera"
+        }
+      ],
+      "quality_criteria": [
+        "The figure reads as a silhouette against a brighter background.",
+        "The frame is not so dark that the subject disappears entirely.",
+        "The subject fills the frame at close-up scale."
+      ]
+    }
+  ]
+}

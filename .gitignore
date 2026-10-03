@@ -1,0 +1,27 @@
+# Production output — these are large and reproducible from the specs.
+runs/
+*.blend1
+*.blend2
+
+# Local configuration (may contain machine-specific paths)
+filmautomator.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+
+# Render scratch
+*.mp4
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.exr
+!docs/**/*.png
+
+# macOS
+.DS_Store

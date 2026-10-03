@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "filmautomator"
+version = "0.1.0"
+description = "Autonomous, zero-budget AI filmmaking on Blender + FFmpeg"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+# Deliberately empty. The whole system runs on the Python standard library
+# plus Blender's bundled numpy. There is nothing to pip install, and therefore
+# nothing that can break, drift, or start asking for a credit card.
+dependencies = []
+
+[project.optional-dependencies]
+# Only needed if you want to run the test suite.
+dev = ["pytest>=7.4"]
+
+[project.scripts]
+filmautomator = "filmautomator.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["filmautomator*"]
+
+[tool.setuptools.package-data]
+filmautomator = ["blender/scripts/*.py"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
