@@ -117,6 +117,32 @@ Then in Claude Code:
 You should see `filmautomator` listed with 50 tools. (Check without a client:
 `filmautomator mcp --list-tools`.)
 
+### 2b. Or install it as a Claude Desktop extension
+
+For Claude Desktop, the same server ships as an `.mcpb` bundle:
+
+```bash
+sh scripts/build_mcpb.sh
+# -> dist/filmautomator.mcpb
+```
+
+Then drag `dist/filmautomator.mcpb` onto Claude Desktop, or open
+**Settings → Extensions → Advanced → Install Extension…** and pick it.
+
+The bundle is a launcher, not a copy of the server: it runs the checkout you
+point it at, so it cannot drift from your code. Two settings are collected at
+install time — the **project folder** (default
+`/Users/sahinsamrat/Downloads/blender`) and the **Python 3 executable**
+(default `/opt/homebrew/bin/python3`).
+
+It launches exactly what the CLI launches. `packaging/mcpb/server/main.py` puts
+the project on `sys.path` and calls the same entry point as
+`python3 -m filmautomator mcp`, so there is one server, not two.
+
+The bundle is stdio-only and binds nothing to the network. Building it uses the
+official MCPB toolchain via `npx` (free, MIT); nothing is installed permanently
+and Blender and FFmpeg remain the only system requirements.
+
 ### 3. Make a film
 
 Just talk to it:
@@ -281,6 +307,7 @@ task at runtime.
 python3 -m pytest tests -q          # 172 unit + integration tests
 python3 tests/smoke_blender.py      # 26 checks against real Blender
 sh scripts/verify_mcp_sdk.sh        # interop check with the official MCP SDK
+sh scripts/build_mcpb.sh            # build the .mcpb and verify it end to end
 python3 scripts/check_dashboard_live.py   # dashboard vs a real production
 ```
 

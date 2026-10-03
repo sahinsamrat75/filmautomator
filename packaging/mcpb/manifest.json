@@ -1,0 +1,89 @@
+{
+  "manifest_version": "0.3",
+  "name": "filmautomator",
+  "display_name": "FilmAutomator",
+  "version": "0.1.0",
+  "description": "Autonomous AI filmmaking on Blender and FFmpeg: plan shots, build scenes, review renders, and produce a finished movie.",
+  "long_description": "FilmAutomator turns a plain-language objective into a finished film using software already on this machine.\n\nGive it a creative brief and it plans shots, builds each one in Blender, renders a preview, inspects that preview with a Vision Agent, corrects what looks wrong, renders at final quality, and assembles the result with FFmpeg.\n\n**No paid services.** It runs entirely locally on Blender, FFmpeg, Python and SQLite. A model server (LM Studio, Ollama, llama.cpp) is optional: without one it falls back to a deterministic plan and judges frames from pixel measurement alone, labelling every synthetic decision as such.\n\n**What it does not do.** This is a production tool, not a chat toy. It renders real frames, which takes real time — `start_production` returns immediately and the work continues in the background. Because a production owns a Blender session on one machine, only one runs at a time.\n\n**Requirements on this machine.** Blender 4.x/5.x and FFmpeg must already be installed (`brew install --cask blender ffmpeg`). Use the `doctor` tool or `filmautomator doctor` to check.\n\nThe server speaks MCP over stdio and binds nothing to the network.",
+  "author": {
+    "name": "Sahin Samrat",
+    "url": "https://github.com/sahinsamrat75"
+  },
+  "homepage": "https://github.com/sahinsamrat75/filmautomator",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/sahinsamrat75/filmautomator"
+  },
+  "support": "https://github.com/sahinsamrat75/filmautomator/issues",
+  "license": "MIT",
+  "keywords": [
+    "film",
+    "video",
+    "blender",
+    "ffmpeg",
+    "animation",
+    "3d",
+    "rendering",
+    "local-first"
+  ],
+  "compatibility": {
+    "platforms": ["darwin", "linux"],
+    "runtimes": {
+      "python": ">=3.11"
+    }
+  },
+  "server": {
+    "type": "python",
+    "entry_point": "server/main.py",
+    "mcp_config": {
+      "command": "${user_config.python_path}",
+      "args": ["${__dirname}/server/main.py"],
+      "env": {
+        "FA_PROJECT_DIR": "${user_config.project_dir}",
+        "PYTHONPATH": "${user_config.project_dir}",
+        "FA_WORKSPACE": "${user_config.project_dir}/projects",
+        "PYTHONUNBUFFERED": "1",
+        "PYTHONDONTWRITEBYTECODE": "1"
+      }
+    }
+  },
+  "user_config": {
+    "project_dir": {
+      "type": "directory",
+      "title": "FilmAutomator project folder",
+      "description": "The folder containing the 'filmautomator' package and the 'projects' output directory. This must be the checkout you want the extension to run, for example /Users/sahinsamrat/Downloads/blender.",
+      "required": true,
+      "default": "/Users/sahinsamrat/Downloads/blender"
+    },
+    "python_path": {
+      "type": "string",
+      "title": "Python 3 executable",
+      "description": "Absolute path to the python3 that will run the server. Must be Python 3.11 or newer. Blender and FFmpeg are separate requirements and are checked by the 'doctor' tool.",
+      "required": true,
+      "default": "/opt/homebrew/bin/python3"
+    }
+  },
+  "tools_generated": true,
+  "tools": [
+    {
+      "name": "create_project",
+      "description": "Create a new film project and return its project_id."
+    },
+    {
+      "name": "start_production",
+      "description": "Begin producing a film in the background from a plain-language objective."
+    },
+    {
+      "name": "get_production_status",
+      "description": "Current run state, progress, current shot and what the agents are doing."
+    },
+    {
+      "name": "get_preview",
+      "description": "The latest rendered preview for a shot, as an actual image."
+    },
+    {
+      "name": "get_final_movie",
+      "description": "The finished film: path, duration, resolution, frame rate and codec."
+    }
+  ]
+}

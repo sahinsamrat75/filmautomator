@@ -4,6 +4,9 @@ runs/
 *.blend1
 *.blend2
 
+# Built extension — reproducible with scripts/build_mcpb.sh
+dist/
+
 # Local configuration (may contain machine-specific paths)
 filmautomator.toml
 
