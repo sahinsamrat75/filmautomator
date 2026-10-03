@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import logging
 import sys
+import time
 from pathlib import Path
 
 from .blender.session import BlenderSession
@@ -285,6 +286,71 @@ def cmd_events(args: argparse.Namespace) -> int:
         return 0
 
 
+def cmd_mcp(args: argparse.Namespace) -> int:
+    """Serve the Filmautomator MCP server.
+
+    stdout is the protocol stream, so nothing else may be printed there. All
+    diagnostics go to stderr.
+    """
+    from .mcp.server import MCPServer, serve_http, serve_stdio
+    from .mcp.tools import list_tools
+
+    config = load_config()
+    if args.http_port:
+        config.mcp_http_port = args.http_port
+
+    server = MCPServer(config=config)
+
+    if args.list_tools:
+        for descriptor in list_tools():
+            print(f"{descriptor['name']:<32} "
+                  f"{descriptor['description'].splitlines()[0][:80]}")
+        server.close()
+        return 0
+
+    if args.http_only or config.mcp_http_port:
+        port = config.mcp_http_port or 8766
+        serve_http(server, host="127.0.0.1", port=port)
+        print(f"Filmautomator MCP (HTTP) on http://127.0.0.1:{port}",
+              file=sys.stderr)
+        if args.http_only:
+            print("Press Ctrl-C to stop.", file=sys.stderr)
+            try:
+                while True:
+                    time.sleep(1)
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.close()
+            return 0
+
+    # stdio is the transport Claude Code and other local clients expect.
+    logging.getLogger("filmautomator").setLevel(logging.WARNING)
+    return serve_stdio(server)
+
+
+def cmd_dashboard(args: argparse.Namespace) -> int:
+    """Run the live production dashboard."""
+    from .dashboard import serve_dashboard
+
+    config = load_config()
+    if args.port:
+        config.dashboard_port = args.port
+    dashboard = serve_dashboard(config, port=config.dashboard_port,
+                                open_browser=args.open)
+    url = f"http://127.0.0.1:{dashboard.port}"
+    print(f"Filmautomator dashboard: {url}")
+    print("Press Ctrl-C to stop.")
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        dashboard.stop()
+    return 0
+
+
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
@@ -356,6 +422,27 @@ def build_parser() -> argparse.ArgumentParser:
     events.add_argument("project_id", nargs="?", default="")
     events.add_argument("--limit", type=int, default=40)
     events.set_defaults(func=cmd_events)
+
+    mcp = sub.add_parser(
+        "mcp",
+        help="serve the MCP server (stdio by default)",
+        description="Serve Filmautomator as an MCP server. With no arguments it "
+                    "runs on stdio, which is what Claude Code and other local "
+                    "MCP clients expect. stdout carries protocol messages only.",
+    )
+    mcp.add_argument("--http-port", type=int, default=0,
+                     help="also serve a localhost HTTP transport on this port")
+    mcp.add_argument("--http-only", action="store_true",
+                     help="serve only HTTP, not stdio")
+    mcp.add_argument("--list-tools", action="store_true",
+                     help="print the available tools and exit")
+    mcp.set_defaults(func=cmd_mcp)
+
+    dash = sub.add_parser("dashboard", help="run the live production dashboard")
+    dash.add_argument("--port", type=int, default=0, help="port (default 8765)")
+    dash.add_argument("--open", action="store_true",
+                      help="open the dashboard in a browser")
+    dash.set_defaults(func=cmd_dashboard)
 
     return parser
 

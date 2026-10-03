@@ -20,6 +20,7 @@ show live status without the producer knowing what the interface is.
 
 from __future__ import annotations
 
+import json
 import logging
 import traceback
 from dataclasses import dataclass, field
@@ -28,7 +29,8 @@ from typing import Any, Callable
 
 from .agents import AgentContext, BlenderAgent, Director, PlanResult, ShotProduction, VisionAgent
 from .blender.session import BlenderSession, BlenderUnavailable
-from .config import AppConfig, load_config
+from .config import AppConfig, find_blender, load_config
+from .core.events import EventBus, EventKind
 from .core.project import ProjectDB
 from .core.spec import ShotSpec
 from .core.task import QAStatus, Task, TaskStatus
@@ -64,6 +66,13 @@ class ProductionRequest:
     #: A JSON file holding a shot plan to use verbatim instead of asking the
     #: Director to invent one. Lets the owner hand in their own shot list.
     plan_file: str = ""
+    #: Produce into an existing project instead of creating a new one. This is
+    #: what lets an MCP client create a project and then start production
+    #: against it as a separate step.
+    project_id: str = ""
+    #: Restrict production to these shot ids. Used when re-rendering or
+    #: retrying a single shot rather than the whole film.
+    only_shots: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -109,14 +118,30 @@ class Producer:
     """Owns the whole pipeline for one production run."""
 
     def __init__(self, config: AppConfig | None = None,
-                 progress: ProgressFn | None = None) -> None:
+                 progress: ProgressFn | None = None,
+                 events: EventBus | None = None) -> None:
         self.config = config or load_config()
         self.progress = progress
         self.gateway = ModelGateway(self.config.gateway)
         self.encoder = VideoEncoder()
+        self.events = events if events is not None else EventBus()
         self.session: BlenderSession | None = None
         self._db: ProjectDB | None = None
         self._workspace: Workspace | None = None
+        #: Optional cooperative stop/pause gate, injected by ProductionRunner.
+        self.control: Any = None
+        #: Called with the project id as soon as it is known. The runner uses
+        #: this to bind cross-process control to the right project before any
+        #: real work starts.
+        self.on_project_started: Any = None
+        #: The objective production is actually working to, which may come from
+        #: an existing project row rather than the request.
+        self._objective: str = ""
+
+    def checkpoint(self) -> None:
+        """Yield to a pending pause or stop request, if one is set."""
+        if self.control is not None:
+            self.control.checkpoint()
 
     # -- progress ----------------------------------------------------------
 
@@ -133,6 +158,14 @@ class Producer:
     def preflight(self, *, require_ffmpeg: bool = True) -> list[str]:
         """Check required tools, raising with actionable instructions."""
         missing: list[str] = []
+
+        # Resolve the executable the same way BlenderSession does, rather than
+        # trusting the config to already carry it. A config constructed in code
+        # (rather than via load_config) legitimately has this unset, and
+        # insisting "Blender is missing" while it sits in /Applications would be
+        # a straightforwardly wrong thing to tell the owner.
+        if self.config.blender.executable is None:
+            self.config.blender.executable = find_blender()
 
         blender = self.config.blender.executable
         if blender is None or not Path(blender).is_file():
@@ -176,21 +209,49 @@ class Producer:
 
         name = request.title or request.objective[:60] or "Untitled production"
         self._db = ProjectDB(Path(self.config.workspace) / "registry.db")
-        project_id = self._db.create_project(
-            name=name,
-            objective=request.objective,
-            workspace=str(self.config.workspace),
-            metadata={
-                "duration_s": request.duration_s,
-                "style": request.style,
-                "offline": request.offline,
-            },
-        )
+
+        existing = (self._db.get_project(request.project_id)
+                    if request.project_id else None)
+        if existing is not None:
+            # Producing into a project that already exists: keep its identity
+            # and its artifacts, and let a new objective update the brief.
+            project_id = existing["project_id"]
+            name = existing["name"]
+            if request.objective:
+                self._db.update_project(project_id, objective=request.objective)
+            objective = request.objective or existing.get("objective", "")
+        else:
+            project_id = self._db.create_project(
+                name=name,
+                objective=request.objective,
+                workspace=str(self.config.workspace),
+                metadata={
+                    "duration_s": request.duration_s,
+                    "style": request.style,
+                    "offline": request.offline,
+                },
+            )
+            objective = request.objective
+
+        self._objective = objective
         self._workspace = Workspace.create(
             Path(self.config.workspace), project_id, name
         )
+        self.events.bind_db(self._db)
+
+        if self.on_project_started is not None:
+            try:
+                self.on_project_started(project_id)
+            except Exception:  # noqa: BLE001 - a bookkeeping hook, not production
+                log.debug("on_project_started hook failed", exc_info=True)
 
         self.announce(f"project {project_id} created at {self._workspace.root}")
+        self.events.emit(
+            project_id, EventKind.PROJECT_CREATED,
+            f"Project {name!r} created",
+            payload={"name": name, "objective": request.objective,
+                     "workspace": str(self._workspace.root)},
+        )
 
         self.session = BlenderSession(self.config.blender)
         try:
@@ -200,8 +261,14 @@ class Producer:
                 f"Blender could not be started: {exc}",
                 [str(exc)],
             ) from exc
-        self.announce(
-            f"Blender {self.session.ping().get('blender_version', '?')} ready"
+        blender_version = self.session.ping().get("blender_version", "?")
+        self.announce(f"Blender {blender_version} ready")
+        self.events.emit(
+            project_id, EventKind.BLENDER_STARTED,
+            f"Blender {blender_version} ready",
+            agent="blender_agent",
+            payload={"version": blender_version,
+                     "executable": str(self.config.blender.executable or "")},
         )
         return project_id, self._workspace, self._db
 
@@ -238,8 +305,17 @@ class Producer:
             workspace=str(workspace.root),
             success=False,
         )
+        # May differ from the request when producing into an existing project.
+        objective = self._objective or request.objective
 
         try:
+            bus = self.events
+            bus.emit(project_id, EventKind.PRODUCTION_STARTED,
+                     f"Production started: {objective}",
+                     agent="director",
+                     payload={"objective": objective,
+                              "duration_s": request.duration_s})
+
             context = AgentContext(
                 gateway=self.gateway,
                 config=self.config,
@@ -248,6 +324,8 @@ class Producer:
                 workspace=workspace,
                 session=self.session,
                 progress=self._agent_progress,
+                events=bus,
+                control=self.control,
             )
             blender_agent = BlenderAgent(context, self.session, self.config.render)
             vision_agent = VisionAgent(context)
@@ -261,9 +339,9 @@ class Producer:
 
             # 1-2. Plan.
             plan_task = Task(
-                objective=f"Plan a {request.duration_s:.0f}s sequence: {request.objective}",
+                objective=f"Plan a {request.duration_s:.0f}s sequence: {objective}",
                 agent="director", project_id=project_id,
-                inputs={"objective": request.objective,
+                inputs={"objective": objective,
                         "duration_s": request.duration_s},
                 priority=10,
             )
@@ -273,11 +351,11 @@ class Producer:
                 plan = self._load_plan_file(request.plan_file)
                 plan.notes.append(f"Plan loaded from {request.plan_file}.")
             elif request.offline:
-                plan = Director._fallback_plan(request.objective, request.duration_s)
+                plan = Director._fallback_plan(objective, request.duration_s)
                 plan.notes.append("Offline mode requested; deterministic plan used.")
             else:
                 plan = director.plan_shots(
-                    request.objective, request.duration_s,
+                    objective, request.duration_s,
                     style=request.style, extra_context=request.extra_context,
                 )
             result.plan = plan
@@ -302,7 +380,25 @@ class Producer:
             # 3-8. Produce each shot: build, preview, inspect, correct, final render.
             shot_videos: list[Path] = []
             frames_by_shot: dict[str, Path] = {}
-            for shot_spec in plan.shots:
+            shots_to_produce = plan.shots
+            if request.only_shots:
+                wanted = set(request.only_shots)
+                shots_to_produce = [s for s in plan.shots if s.shot_id in wanted]
+                missing = wanted - {s.shot_id for s in plan.shots}
+                if missing:
+                    result.notes.append(
+                        "requested shots not present in the plan: "
+                        + ", ".join(sorted(missing))
+                    )
+                if not shots_to_produce:
+                    result.error = (
+                        "none of the requested shots exist in this project's plan"
+                    )
+                    result.report_path = str(self._write_report(result, project_id))
+                    return result
+
+            for shot_spec in shots_to_produce:
+                self.checkpoint()
                 shot_task = Task(
                     objective=f"Produce {shot_spec.shot_id}: {shot_spec.description}",
                     agent="director", project_id=project_id,
@@ -337,7 +433,10 @@ class Producer:
 
             # 9. Assemble the timeline.
             self.announce(f"assembling timeline from {len(shot_videos)} shot(s)")
-            timeline = workspace.final_video("timeline.mp4")
+            bus.emit(project_id, EventKind.EDITING_STARTED,
+                     f"Assembling timeline from {len(shot_videos)} shot(s)",
+                     agent="editorial", payload={"shots": len(shot_videos)})
+            timeline = workspace.editorial_dir / "timeline.mp4"
             try:
                 if len(shot_videos) == 1:
                     # A single shot needs no concat pass; copy it into place.
@@ -347,11 +446,20 @@ class Producer:
                     self.encoder.concat(shot_videos, timeline)
             except FFmpegError as exc:
                 result.error = f"Timeline assembly failed: {exc}"
+                bus.emit(project_id, EventKind.PRODUCTION_FAILED, result.error,
+                         agent="editorial")
                 result.report_path = str(self._write_report(result, project_id))
                 return result
 
-            # 10. Final delivery file.
-            final = workspace.final_video("final.mp4")
+            db.register_artifact(project_id, "timeline", str(timeline),
+                                 "Assembled picture cut")
+            bus.emit(project_id, EventKind.EDITING_COMPLETED,
+                     "Timeline assembled", agent="editorial",
+                     payload={"timeline": str(timeline)})
+
+            # 10. Final delivery file, always under final/ and named for the
+            # project so the owner never has to hunt for it.
+            final = workspace.final_video()
             expected_audio = any(s.audio.dialogue or s.audio.sfx or s.audio.ambience
                                  for s in plan.shots)
             try:
@@ -364,9 +472,15 @@ class Producer:
                 shutil.copy2(timeline, final)
 
             result.final_video = str(final)
+            db.register_artifact(project_id, "final_movie", str(final),
+                                 f"{plan.title} — final movie",
+                                 metadata={"shots": len(plan.shots),
+                                           "fps": self.config.render.fps})
 
             # 11. Final QA.
             self.announce("running final QA")
+            bus.emit(project_id, EventKind.QA_STARTED, "Running final QA",
+                     agent="final_qa")
             qa = FinalQA(
                 self.encoder,
                 fps=self.config.render.fps,
@@ -399,7 +513,34 @@ class Producer:
                     f"{len(qa_report.failures)} QA check(s) failed; "
                     "corrective tasks were logged."
                 )
+            qa_report_path = workspace.qa_report()
+            qa_report_path.write_text(
+                json.dumps(qa_report.to_dict(), indent=2), encoding="utf-8"
+            )
+            db.register_artifact(project_id, "qa_report", str(qa_report_path),
+                                 "Final QA report")
+            bus.emit(
+                project_id,
+                EventKind.QA_PASSED if qa_report.passed else EventKind.QA_FAILED,
+                (f"Final QA passed (score {qa_report.score:.2f})"
+                 if qa_report.passed else
+                 f"Final QA failed — {len(qa_report.failures)} check(s)"),
+                agent="final_qa",
+                payload={"report": qa_report.to_dict()},
+            )
+
             result.report_path = str(self._write_report(result, project_id))
+            bus.emit(
+                project_id,
+                EventKind.PRODUCTION_COMPLETED if result.success
+                else EventKind.PRODUCTION_FAILED,
+                (f"Production complete — {final.name}"
+                 if result.success else "Production finished with QA failures"),
+                agent="director",
+                payload={"final_movie": str(final),
+                         "duration_s": getattr(qa_report, "duration_s", 0.0) or 0.0,
+                         "success": result.success},
+            )
             return result
 
         except Exception as exc:  # noqa: BLE001 - report, never crash the owner's run
@@ -523,8 +664,7 @@ class Producer:
         report_path = workspace.report("production_report.txt")
         report_path.write_text("\n".join(lines), encoding="utf-8")
 
-        workspace.write_json("reports/production_report.json", {
-            "project_id": project_id,
+        workspace.write_json("reports/production_report.json", {            "project_id": project_id,
             "success": result.success,
             "error": result.error,
             "final_video": result.final_video,
@@ -540,4 +680,11 @@ class Producer:
             "plan": result.plan.to_dict() if result.plan else None,
             "notes": result.notes,
         })
+        if self._db is not None:
+            try:
+                self._db.register_artifact(
+                    project_id, "report", str(report_path), "Production report"
+                )
+            except Exception:  # noqa: BLE001 - a report is not worth failing over
+                pass
         return report_path

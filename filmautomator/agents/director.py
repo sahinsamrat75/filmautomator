@@ -16,6 +16,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Any
 
+from ..core.events import EventKind
 from ..core.spec import (
     AudioRequirement,
     CameraSpec,
@@ -398,6 +399,8 @@ class Director(Agent):
         current = spec
 
         for round_no in range(1, self.max_rounds + 1):
+            # Safe stopping point: nothing is half-rendered here.
+            self.ctx.checkpoint()
             result.rounds = round_no
             result.version = round_no
             self.ctx.workspace.prepare_shot_version(spec.shot_id, round_no)
@@ -497,6 +500,9 @@ class Director(Agent):
 
         # -- encode the shot --
         try:
+            self.emit(EventKind.EDITING_STARTED,
+                      f"Encoding {spec.shot_id} v{result.version:03d}",
+                      task=parent, shot_id=spec.shot_id, scene_id=spec.scene_id)
             video = self.ctx.workspace.shot_video(spec.shot_id, result.version)
             self.encoder.encode_frames(frames_dir, video, fps=self.fps)
             result.video_path = str(video)
@@ -510,6 +516,16 @@ class Director(Agent):
                 qa=result.final_report.to_dict(),
                 notes="final",
             )
+            self.ctx.db.register_artifact(
+                self.ctx.project_id, "shot_video", str(video),
+                f"{spec.shot_id} v{result.version:03d}",
+                shot_id=spec.shot_id, scene_id=spec.scene_id,
+                metadata={"version": result.version, "fps": self.fps},
+            )
+            self.emit(EventKind.EDITING_COMPLETED,
+                      f"Encoded {spec.shot_id} v{result.version:03d}",
+                      task=parent, shot_id=spec.shot_id, scene_id=spec.scene_id,
+                      payload={"video": str(video)})
         except Exception as exc:  # noqa: BLE001
             result.notes.append(f"shot encode failed — {exc}")
             self.log.error("encode failed for %s: %s", spec.shot_id, exc)
@@ -528,6 +544,11 @@ class Director(Agent):
                 QAStatus.PASSED, score=result.final_report.score,
                 findings=[f.to_dict() for f in result.final_report.findings],
             )
+            self.emit(EventKind.SHOT_APPROVED,
+                      f"{spec.shot_id} approved (score {result.final_report.score:.2f})",
+                      task=parent, shot_id=spec.shot_id, scene_id=spec.scene_id,
+                      payload={"version": result.version,
+                               "score": result.final_report.score})
         else:
             self.ctx.db.set_shot_status(self.ctx.project_id, spec.shot_id, "REVIEW")
             self.ctx.db.record_qa(
@@ -535,6 +556,14 @@ class Director(Agent):
                 QAStatus.NEEDS_REVISION, score=result.final_report.score,
                 findings=[f.to_dict() for f in result.final_report.findings],
             )
+            self.emit(EventKind.SHOT_REJECTED,
+                      f"{spec.shot_id} needs review (score "
+                      f"{result.final_report.score:.2f})",
+                      task=parent, shot_id=spec.shot_id, scene_id=spec.scene_id,
+                      payload={"version": result.version,
+                               "score": result.final_report.score,
+                               "findings": [f.to_dict()
+                                            for f in result.final_report.findings]})
             # Only bother the owner when the result is genuinely poor.
             if result.final_report.score < 0.35:
                 self.ask_owner(

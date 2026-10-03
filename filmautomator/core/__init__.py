@@ -1,5 +1,6 @@
-"""Core domain: tasks, project memory, production specs, workspace layout."""
+"""Core domain: tasks, project memory, production specs, events, workspace."""
 
+from .events import Event, EventBus, EventKind, default_bus, reset_default_bus
 from .project import ProjectDB, ShotVersion
 from .spec import (
     AudioRequirement,
@@ -12,12 +13,17 @@ from .spec import (
     SubjectSpec,
 )
 from .task import Artifact, QAStatus, Task, TaskStatus, new_id
-from .workspace import Workspace
+from .workspace import ASSET_KINDS, AUDIO_KINDS, Workspace, slugify
 
 __all__ = [
+    "ASSET_KINDS",
+    "AUDIO_KINDS",
     "Artifact",
     "AudioRequirement",
     "CameraSpec",
+    "Event",
+    "EventBus",
+    "EventKind",
     "LightingSpec",
     "ProjectDB",
     "QAStatus",
@@ -30,5 +36,8 @@ __all__ = [
     "Task",
     "TaskStatus",
     "Workspace",
+    "default_bus",
     "new_id",
+    "reset_default_bus",
+    "slugify",
 ]

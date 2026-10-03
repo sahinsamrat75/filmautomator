@@ -13,6 +13,7 @@ from typing import Any
 
 from ..blender.session import BlenderSession
 from ..config import AppConfig
+from ..core.events import EventBus, EventKind, default_bus
 from ..core.project import ProjectDB
 from ..core.task import Artifact, QAStatus, Task, TaskStatus
 from ..core.workspace import Workspace
@@ -32,7 +33,28 @@ class AgentContext:
     session: BlenderSession | None = None
     #: Set by the orchestrator so agents can report progress to the owner UI.
     progress: Any = None
+    #: Production event bus. Every meaningful action is published here so the
+    #: dashboard and any connected AI client can follow along.
+    events: EventBus | None = None
+    #: Cooperative stop/pause gate. Anything with a checkpoint() method works;
+    #: None means "run to completion".
+    control: Any = None
     log: logging.Logger = field(default_factory=lambda: logging.getLogger("filmautomator"))
+
+    def checkpoint(self) -> None:
+        """Yield to the owner's pause/stop request, if one is pending.
+
+        Called at points where stopping is safe — between shots and between
+        revision rounds — never mid-render.
+        """
+        if self.control is not None:
+            self.control.checkpoint()
+
+    def bus(self) -> EventBus:
+        """The event bus, creating a process-wide one if none was injected."""
+        if self.events is None:
+            self.events = default_bus(self.db)
+        return self.events
 
 
 class Agent:
@@ -86,41 +108,53 @@ class Agent:
     def start_task(self, task: Task) -> Task:
         task.touch(TaskStatus.RUNNING)
         self.ctx.db.save_task(task)
+        self.emit(EventKind.TASK_STARTED, task.objective, task=task)
         self.announce(f"{self.name}: {task.objective}")
-        self.ctx.db.log_event(
-            self.ctx.project_id, "task_started", task.objective,
-            {"task_id": task.task_id, "agent": self.name}, task.task_id,
-        )
         return task
 
     def complete_task(self, task: Task, **outputs: Any) -> Task:
         task.outputs.update(outputs)
         task.touch(TaskStatus.COMPLETED)
         self.ctx.db.save_task(task)
-        self.ctx.db.log_event(
-            self.ctx.project_id, "task_completed", task.objective,
-            {"task_id": task.task_id, "agent": self.name}, task.task_id,
-        )
+        self.emit(EventKind.TASK_COMPLETED, task.objective, task=task)
         return task
 
     def fail_task(self, task: Task, error: str) -> Task:
         task.fail(error)
         self.ctx.db.save_task(task)
-        self.ctx.db.log_event(
-            self.ctx.project_id, "task_failed", error,
-            {"task_id": task.task_id, "agent": self.name}, task.task_id,
-        )
+        self.emit(EventKind.TASK_FAILED, error, task=task, payload={"error": error})
         self.log.error("task %s failed: %s", task.task_id, error)
         return task
 
     def attach(self, task: Task, kind: str, path: str, label: str = "", **meta: Any) -> Artifact:
         artifact = task.add_artifact(kind, path, label, **meta)
         self.ctx.db.save_task(task)
+        self.ctx.db.register_artifact(
+            self.ctx.project_id, kind, path, label, metadata=meta,
+        )
+        self.emit(EventKind.ARTIFACT_CREATED, f"{kind}: {label or path}",
+                  task=task, payload={"kind": kind, "path": str(path)})
         return artifact
 
     def set_qa(self, task: Task, status: QAStatus) -> None:
         task.qa_status = status
         self.ctx.db.save_task(task)
+
+    # -- events ------------------------------------------------------------
+
+    def emit(self, kind: str, message: str, *, task: Task | None = None,
+             shot_id: str = "", scene_id: str = "",
+             payload: dict[str, Any] | None = None) -> None:
+        """Publish a production event."""
+        try:
+            self.ctx.bus().emit(
+                self.ctx.project_id, kind, message,
+                agent=self.name,
+                task_id=task.task_id if task is not None else "",
+                shot_id=shot_id, scene_id=scene_id, payload=payload,
+            )
+        except Exception:  # noqa: BLE001 - observability must not break production
+            self.log.debug("event emit failed for %s", kind, exc_info=True)
 
     # -- owner-facing messaging -------------------------------------------
 

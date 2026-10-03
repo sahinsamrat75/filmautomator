@@ -33,7 +33,7 @@ from .task import Artifact, QAStatus, Task, TaskStatus, new_id
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -177,15 +177,67 @@ CREATE TABLE IF NOT EXISTS decisions (
 CREATE INDEX IF NOT EXISTS idx_decisions_status ON decisions(project_id, status);
 
 CREATE TABLE IF NOT EXISTS events (
-    event_id   TEXT PRIMARY KEY,
+    seq        INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id   TEXT NOT NULL UNIQUE,
     project_id TEXT NOT NULL,
     task_id    TEXT NOT NULL DEFAULT '',
+    agent      TEXT NOT NULL DEFAULT '',
+    scene_id   TEXT NOT NULL DEFAULT '',
+    shot_id    TEXT NOT NULL DEFAULT '',
     kind       TEXT NOT NULL,
     message    TEXT NOT NULL,
     payload    TEXT NOT NULL DEFAULT '{}',
     created_at TEXT NOT NULL
 );
-CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_events_project ON events(project_id, seq);
+
+CREATE TABLE IF NOT EXISTS artifacts (
+    artifact_id TEXT PRIMARY KEY,
+    project_id  TEXT NOT NULL,
+    kind        TEXT NOT NULL,
+    label       TEXT NOT NULL DEFAULT '',
+    path        TEXT NOT NULL,
+    shot_id     TEXT NOT NULL DEFAULT '',
+    scene_id    TEXT NOT NULL DEFAULT '',
+    bytes       INTEGER NOT NULL DEFAULT 0,
+    metadata    TEXT NOT NULL DEFAULT '{}',
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_artifacts_lookup ON artifacts(project_id, kind, created_at);
+
+-- Live production state, written by whichever process is running the
+-- production. The CLI, the MCP server and the dashboard are separate
+-- processes, so run state cannot live only in memory: a dashboard that read
+-- its own empty runner would cheerfully report IDLE while a film was being
+-- rendered in another process.
+CREATE TABLE IF NOT EXISTS production_runs (
+    project_id   TEXT PRIMARY KEY,
+    state        TEXT NOT NULL,
+    objective    TEXT NOT NULL DEFAULT '',
+    stage        TEXT NOT NULL DEFAULT '',
+    current_shot TEXT NOT NULL DEFAULT '',
+    shots_total  INTEGER NOT NULL DEFAULT 0,
+    shots_done   INTEGER NOT NULL DEFAULT 0,
+    percent      REAL NOT NULL DEFAULT 0,
+    error        TEXT NOT NULL DEFAULT '',
+    pid          INTEGER NOT NULL DEFAULT 0,
+    started_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL,
+    finished_at  TEXT NOT NULL DEFAULT ''
+);
+
+-- Control requests travel the same way: the dashboard asks for a pause by
+-- writing a row, and the process actually running the production picks it up
+-- at its next safe point.
+CREATE TABLE IF NOT EXISTS control_requests (
+    seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+    project_id  TEXT NOT NULL,
+    action      TEXT NOT NULL,
+    status      TEXT NOT NULL DEFAULT 'PENDING',
+    created_at  TEXT NOT NULL,
+    consumed_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_controls_pending ON control_requests(project_id, status);
 """
 
 
@@ -323,8 +375,10 @@ class ProjectDB:
             (project_id, name, objective, workspace,
              json.dumps(metadata or {}), now, now),
         )
-        self.log_event(project_id, "project_created", f"Project {name!r} created",
-                       {"objective": objective})
+        # Deliberately no event here. Creation is announced by the caller
+        # through the event bus, which both persists it and pushes it to live
+        # subscribers; logging it here as well produced a duplicate row for
+        # every project.
         return project_id
 
     def get_project(self, project_id: str) -> dict[str, Any] | None:
@@ -795,21 +849,33 @@ class ProjectDB:
     # -- event log ---------------------------------------------------------
 
     def log_event(self, project_id: str, kind: str, message: str,
-                  payload: dict[str, Any] | None = None, task_id: str = "") -> str:
-        event_id = new_id("evt")
-        self._execute(
-            "INSERT INTO events(event_id, project_id, task_id, kind, message, payload,"
-            " created_at) VALUES(?,?,?,?,?,?,?)",
-            (event_id, project_id, task_id, kind, message,
-             json.dumps(payload or {}), _now()),
-        )
-        return event_id
+                  payload: dict[str, Any] | None = None, task_id: str = "",
+                  *, agent: str = "", scene_id: str = "",
+                  shot_id: str = "") -> int:
+        """Append to the production event log and return its sequence number.
 
-    def list_events(self, project_id: str, limit: int = 200) -> list[dict[str, Any]]:
+        The sequence is monotonic, which is what lets a live subscriber resume
+        from a cursor instead of missing events that fired while it was
+        reconnecting.
+        """
+        event_id = new_id("evt")
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT INTO events(event_id, project_id, task_id, agent, scene_id,"
+                " shot_id, kind, message, payload, created_at)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?)",
+                (event_id, project_id, task_id, agent, scene_id, shot_id, kind,
+                 message, json.dumps(payload or {}), _now()),
+            )
+            self._conn.commit()
+            return int(cursor.lastrowid or 0)
+
+    def list_events(self, project_id: str, limit: int = 200,
+                    *, since_seq: int = 0) -> list[dict[str, Any]]:
         rows = self._query(
-            "SELECT * FROM events WHERE project_id=?"
-            " ORDER BY created_at DESC, rowid DESC LIMIT ?",
-            (project_id, limit),
+            "SELECT * FROM events WHERE project_id=? AND seq>?"
+            " ORDER BY seq DESC LIMIT ?",
+            (project_id, since_seq, limit),
         )
         out = []
         for row in rows:
@@ -817,6 +883,169 @@ class ProjectDB:
             data["payload"] = json.loads(data.get("payload") or "{}")
             out.append(data)
         return out
+
+    def events_after(self, project_id: str, since_seq: int,
+                     limit: int = 500) -> list[dict[str, Any]]:
+        """Events in ascending order after a cursor — the live-feed path."""
+        rows = self._query(
+            "SELECT * FROM events WHERE project_id=? AND seq>?"
+            " ORDER BY seq ASC LIMIT ?",
+            (project_id, since_seq, limit),
+        )
+        out = []
+        for row in rows:
+            data = dict(row)
+            data["payload"] = json.loads(data.get("payload") or "{}")
+            out.append(data)
+        return out
+
+    def latest_event_seq(self, project_id: str) -> int:
+        row = self._query_one(
+            "SELECT COALESCE(MAX(seq), 0) AS n FROM events WHERE project_id=?",
+            (project_id,),
+        )
+        return int(row["n"]) if row else 0
+
+    # -- artifacts (spec section 9) ---------------------------------------
+
+    def register_artifact(self, project_id: str, kind: str, path: str,
+                          label: str = "", *, shot_id: str = "",
+                          scene_id: str = "",
+                          metadata: dict[str, Any] | None = None) -> str:
+        """Record a produced file so the owner never has to go looking for it.
+
+        Sizes are captured at registration time; a missing file is recorded as
+        zero bytes rather than raising, because an artifact row that exists and
+        points at nothing is more useful than an exception mid-production.
+        """
+        artifact_id = new_id("art")
+        candidate = Path(path)
+        size = candidate.stat().st_size if candidate.is_file() else 0
+        self._execute(
+            "INSERT INTO artifacts(artifact_id, project_id, kind, label, path,"
+            " shot_id, scene_id, bytes, metadata, created_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?)",
+            (artifact_id, project_id, kind, label, str(path), shot_id, scene_id,
+             size, json.dumps(metadata or {}), _now()),
+        )
+        return artifact_id
+
+    @staticmethod
+    def _artifact_row(row: sqlite3.Row) -> dict[str, Any]:
+        data = dict(row)
+        data["metadata"] = json.loads(data.get("metadata") or "{}")
+        data["exists"] = Path(data["path"]).is_file()
+        return data
+
+    def list_artifacts(self, project_id: str, kind: str | None = None,
+                       limit: int = 500) -> list[dict[str, Any]]:
+        if kind:
+            rows = self._query(
+                "SELECT * FROM artifacts WHERE project_id=? AND kind=?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (project_id, kind, limit),
+            )
+        else:
+            rows = self._query(
+                "SELECT * FROM artifacts WHERE project_id=?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT ?",
+                (project_id, limit),
+            )
+        return [self._artifact_row(r) for r in rows]
+
+    def get_artifact(self, artifact_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT * FROM artifacts WHERE artifact_id=?", (artifact_id,)
+        )
+        return self._artifact_row(row) if row else None
+
+    def latest_artifact(self, project_id: str, kind: str,
+                        shot_id: str | None = None) -> dict[str, Any] | None:
+        if shot_id:
+            row = self._query_one(
+                "SELECT * FROM artifacts WHERE project_id=? AND kind=? AND shot_id=?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (project_id, kind, shot_id),
+            )
+        else:
+            row = self._query_one(
+                "SELECT * FROM artifacts WHERE project_id=? AND kind=?"
+                " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (project_id, kind),
+            )
+        return self._artifact_row(row) if row else None
+
+    # -- live production state (cross-process) -----------------------------
+
+    def upsert_run(self, project_id: str, **fields: Any) -> None:
+        """Record the state of a production run so other processes can see it."""
+        allowed = {"state", "objective", "stage", "current_shot", "shots_total",
+                   "shots_done", "percent", "error", "pid", "started_at",
+                   "finished_at"}
+        now = _now()
+        existing = self._query_one(
+            "SELECT project_id FROM production_runs WHERE project_id=?",
+            (project_id,),
+        )
+        if existing:
+            sets = [f"{k}=?" for k in fields if k in allowed]
+            params = [v for k, v in fields.items() if k in allowed]
+            sets.append("updated_at=?")
+            params.extend([now, project_id])
+            self._execute(
+                f"UPDATE production_runs SET {', '.join(sets)} WHERE project_id=?",
+                tuple(params),
+            )
+            return
+
+        values = {k: v for k, v in fields.items() if k in allowed}
+        values.setdefault("state", "IDLE")
+        values.setdefault("started_at", now)
+        columns = list(values) + ["project_id", "updated_at"]
+        placeholders = ",".join("?" for _ in columns)
+        self._execute(
+            f"INSERT INTO production_runs({', '.join(columns)})"
+            f" VALUES({placeholders})",
+            tuple(list(values.values()) + [project_id, now]),
+        )
+
+    def get_run(self, project_id: str) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT * FROM production_runs WHERE project_id=?", (project_id,)
+        )
+        return dict(row) if row else None
+
+    def latest_run(self) -> dict[str, Any] | None:
+        row = self._query_one(
+            "SELECT * FROM production_runs ORDER BY updated_at DESC, rowid DESC LIMIT 1"
+        )
+        return dict(row) if row else None
+
+    def request_control(self, project_id: str, action: str) -> int:
+        """Ask whichever process is running this production to pause/stop."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "INSERT INTO control_requests(project_id, action, created_at)"
+                " VALUES(?,?,?)",
+                (project_id, action, _now()),
+            )
+            self._conn.commit()
+            return int(cursor.lastrowid or 0)
+
+    def pending_controls(self, project_id: str) -> list[dict[str, Any]]:
+        rows = self._query(
+            "SELECT * FROM control_requests WHERE project_id=? AND status='PENDING'"
+            " ORDER BY seq",
+            (project_id,),
+        )
+        return [dict(r) for r in rows]
+
+    def consume_control(self, seq: int) -> None:
+        self._execute(
+            "UPDATE control_requests SET status='CONSUMED', consumed_at=?"
+            " WHERE seq=?",
+            (_now(), seq),
+        )
 
     # -- progress ----------------------------------------------------------
 

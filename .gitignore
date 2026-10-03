@@ -1,4 +1,5 @@
 # Production output — these are large and reproducible from the specs.
+projects/
 runs/
 *.blend1
 *.blend2

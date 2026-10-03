@@ -19,6 +19,7 @@ from typing import Any
 
 from ..blender.session import BlenderSession
 from ..config import RenderConfig
+from ..core.events import EventKind
 from ..core.spec import LightingSpec, QualityFinding, ShotSpec, SubjectSpec
 from ..core.task import Task
 from ..core.workspace import Workspace
@@ -378,6 +379,10 @@ class BlenderAgent(Agent):
         path = ws.shot_preview(spec.shot_id, version)
         path.parent.mkdir(parents=True, exist_ok=True)
 
+        self.emit(EventKind.PREVIEW_STARTED,
+                  f"Rendering preview for {spec.shot_id} (v{version:03d})",
+                  task=task, shot_id=spec.shot_id, scene_id=spec.scene_id)
+
         settings = self.session.set_render_settings(
             engine=self.render.preview_engine,
             resolution_x=self.render.preview_width,
@@ -426,6 +431,21 @@ class BlenderAgent(Agent):
                                  "falling back to chroma measurement", exc)
                 plate_path = None
 
+        # The dashboard and the Vision Agent must look at the same pixels, so
+        # the preview is registered and mirrored the moment it exists.
+        artifact_id = self.ctx.db.register_artifact(
+            self.ctx.project_id, "preview", str(path),
+            f"{spec.shot_id} v{version:03d} preview",
+            shot_id=spec.shot_id, scene_id=spec.scene_id,
+            metadata={"version": version, **result},
+        )
+        ws.mirror_preview(spec.shot_id, version)
+        self.emit(EventKind.PREVIEW_READY,
+                  f"Preview ready for {spec.shot_id} (v{version:03d})",
+                  task=task, shot_id=spec.shot_id, scene_id=spec.scene_id,
+                  payload={"path": str(path), "artifact_id": artifact_id,
+                           "version": version})
+
         return PreviewRender(
             image_path=path,
             background_path=plate_path,
@@ -441,6 +461,12 @@ class BlenderAgent(Agent):
         out_dir = ws.shot_render_dir(spec.shot_id, version)
 
         frames = spec.frame_count_at(fps)
+        self.emit(EventKind.RENDER_STARTED,
+                  f"Final render {spec.shot_id} v{version:03d} — {frames} frames",
+                  task=task, shot_id=spec.shot_id, scene_id=spec.scene_id,
+                  payload={"frames": frames, "engine": self.render.final_engine,
+                           "width": self.render.final_width,
+                           "height": self.render.final_height})
         self.announce(
             f"final render {spec.shot_id} v{version:03d} — {frames} frames, "
             f"{self.render.final_width}x{self.render.final_height}, "
@@ -465,6 +491,17 @@ class BlenderAgent(Agent):
             kind="final_frames", path=str(out_dir),
             engine=self.render.final_engine, metadata=result,
         )
+        artifact_id = self.ctx.db.register_artifact(
+            self.ctx.project_id, "render", str(out_dir),
+            f"{spec.shot_id} v{version:03d} frames",
+            shot_id=spec.shot_id, scene_id=spec.scene_id,
+            metadata={"version": version, **result},
+        )
+        self.emit(EventKind.RENDER_COMPLETED,
+                  f"Rendered {result.get('frame_count', 0)} frames for {spec.shot_id}",
+                  task=task, shot_id=spec.shot_id, scene_id=spec.scene_id,
+                  payload={"directory": str(out_dir), "artifact_id": artifact_id,
+                           "frame_count": result.get("frame_count", 0)})
         return out_dir
 
     # -- revision ----------------------------------------------------------

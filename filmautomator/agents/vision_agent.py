@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..core.events import EventKind
 from ..core.spec import QualityFinding, QualityReport, ShotSpec
 from ..core.task import Task
 from ..gateway import Capability, ImageInput
@@ -88,6 +89,10 @@ class VisionAgent(Agent):
                 iteration: int = 1) -> QualityReport:
         """Judge one rendered frame against the shot's intent."""
         self.announce(f"inspecting {spec.shot_id} preview (pass {iteration})")
+        self.emit(EventKind.VISION_STARTED,
+                  f"Evaluating preview of {spec.shot_id} (pass {iteration})",
+                  task=task, shot_id=spec.shot_id, scene_id=spec.scene_id,
+                  payload={"preview": image_path, "iteration": iteration})
 
         metrics = self._measure(image_path, background_path)
         findings = self._findings_from_metrics(metrics, spec)
@@ -125,6 +130,21 @@ class VisionAgent(Agent):
         for finding in blocking:
             self.log.info("  [%s/%s] %s", finding.severity, finding.category,
                           finding.description)
+
+        worst = blocking[0].description if blocking else ""
+        self.emit(
+            EventKind.VISION_COMPLETED,
+            (f"{spec.shot_id} rejected: {worst}" if blocking
+             else f"{spec.shot_id} passed review (score {report.score:.2f})"),
+            task=task, shot_id=spec.shot_id, scene_id=spec.scene_id,
+            payload={
+                "passed": passed,
+                "score": report.score,
+                "heuristic_only": heuristic_only,
+                "findings": [f.to_dict() for f in findings],
+                "summary": summary,
+            },
+        )
         return report
 
     # -- pass 1: measurement ----------------------------------------------

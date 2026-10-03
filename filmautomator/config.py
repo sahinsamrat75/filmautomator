@@ -158,8 +158,13 @@ class AppConfig:
     blender: BlenderConfig = field(default_factory=BlenderConfig)
     render: RenderConfig = field(default_factory=RenderConfig)
     limits: LimitsConfig = field(default_factory=LimitsConfig)
-    #: Root directory where project runs are written.
-    workspace: Path = field(default_factory=lambda: Path.cwd() / "runs")
+    #: Root directory where projects are written. Each project gets its own
+    #: directory tree under here (spec section 9).
+    workspace: Path = field(default_factory=lambda: Path.cwd() / "projects")
+    #: Port for the local production dashboard. 0 picks a free port.
+    dashboard_port: int = 8765
+    #: Port for the MCP server's optional network transport. 0 disables it.
+    mcp_http_port: int = 0
 
 
 def _apply_toml(cfg: AppConfig, data: dict) -> None:
