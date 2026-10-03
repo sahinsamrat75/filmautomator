@@ -28,6 +28,8 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT))
 
+from filmautomator.mcp.protocol import SUPPORTED_PROTOCOL_VERSIONS as SUPPORTED  # noqa: E402
+
 PASSED = 0
 FAILED = 0
 
@@ -70,11 +72,18 @@ async def run(workspace: Path) -> int:
         async with ClientSession(read, write) as session:
             init = await session.initialize()
             check("initialize handshake completes", init is not None)
-            server_info = getattr(init, "serverInfo", None)
+            # The SDK models are pydantic, so fields are snake_case here even
+            # though they are camelCase on the wire.
+            server_info = getattr(init, "server_info", None)
             name = getattr(server_info, "name", "") if server_info else ""
+            version = getattr(server_info, "version", "?") if server_info else "?"
+            protocol = getattr(init, "protocol_version", "")
             check("server identifies itself", name == "filmautomator", f"got {name!r}")
-            print(f"        protocol {init.protocolVersion}, server {name} "
-                  f"{getattr(server_info, 'version', '?')}")
+            check("server reports a version", bool(version))
+            check("protocol version was negotiated", bool(protocol), repr(protocol))
+            check("negotiated version is one we support",
+                  protocol in SUPPORTED, repr(protocol))
+            print(f"        protocol {protocol}, server {name} {version}")
 
             tools = await session.list_tools()
             names = {t.name for t in tools.tools}
@@ -90,7 +99,7 @@ async def run(workspace: Path) -> int:
                 {"name": "SDK_VERIFY", "objective": "interop check",
                  "duration_s": 5},
             )
-            check("tool call succeeds", not created.isError)
+            check("tool call succeeds", not created.is_error)
             payload = json.loads(created.content[0].text)
             project_id = payload.get("project_id", "")
             check("project is created", project_id.startswith("proj_"),
@@ -113,11 +122,11 @@ async def run(workspace: Path) -> int:
             # dropping the connection.
             bad = await session.call_tool("get_project",
                                           {"project_id": "proj_missing"})
-            check("a failed call is reported as a tool error", bad.isError)
+            check("a failed call is reported as a tool error", bad.is_error)
 
             # The connection must still work after that.
             again = await session.call_tool("list_projects", {})
-            check("connection survives a failed call", not again.isError)
+            check("connection survives a failed call", not again.is_error)
 
     return 0
 
