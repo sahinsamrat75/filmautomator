@@ -119,28 +119,30 @@ def tool_render_shot_preview(ctx: ToolContext, args: dict) -> dict:
     shot_id = require_str(args, "shot_id")
     project, workspace = ctx.project_and_workspace(project_id)
     spec = _shot_spec(ctx.db, project_id, shot_id)
+    # Every preview gets its own version, never overwriting the previous one.
+    version = ctx.db.next_preview_version(project_id, shot_id)
 
     context = _agent_context(ctx, project_id)
     blender = BlenderAgent(context, ctx.session(), ctx.config.render)
     task = Task(objective=f"preview {shot_id}", agent="blender_agent",
                 project_id=project_id)
 
-    build = blender.build_shot(task, spec, 1)
-    preview = blender.render_preview(task, spec, 1)
+    build = blender.build_shot(task, spec, version)
+    preview = blender.render_preview(task, spec, version)
 
-    mirrored = workspace.mirror_preview(spec.shot_id, 1)
+    mirrored = workspace.mirror_preview(spec.shot_id, version)
     preview_path = str(mirrored or preview.image_path)
     ctx.db.register_artifact(
         project_id, "preview", preview_path,
-        f"{shot_id} preview v001", shot_id=shot_id, scene_id=spec.scene_id,
-        metadata={"version": 1, "engine": preview.engine,
+        f"{shot_id} preview v{version:03d}", shot_id=shot_id, scene_id=spec.scene_id,
+        metadata={"version": version, "engine": preview.engine,
                   "blend": build.blend_path,
                   "shot_local_copy": str(preview.image_path)},
     )
     ctx.emit(project_id, "preview.ready",
-             f"{shot_id} preview rendered ({preview.engine})",
+             f"{shot_id} preview v{version:03d} rendered ({preview.engine})",
              agent="blender_agent", shot_id=shot_id,
-             payload={"preview": str(preview.image_path)})
+             payload={"preview": str(preview.image_path), "version": version})
 
     metadata = build_preview_metadata(
         shot_id=shot_id,
@@ -150,7 +152,7 @@ def tool_render_shot_preview(ctx: ToolContext, args: dict) -> dict:
         camera=_camera_metadata(spec),
         render_settings=_render_metadata(ctx),
         artifact_path=preview_path,
-        version=1,
+        version=version,
         qa=ctx.db.latest_qa(project_id, shot_id, "preview"),
         extra={
             "blend_path": build.blend_path,
@@ -159,6 +161,9 @@ def tool_render_shot_preview(ctx: ToolContext, args: dict) -> dict:
             "description": spec.description,
             "subjects": [s.name for s in spec.subjects],
             "environment": spec.environment,
+            "preview_version": version,
+            "scene_revision": version,
+            "build_verification": build.manifest.get("verification", {}),
         },
     )
 
@@ -392,7 +397,9 @@ def tool_finalize_shot(ctx: ToolContext, args: dict) -> dict:
     }
 
     # Frames are released only from a passing verdict. This is the promotion
-    # point the whole storage policy depends on.
+    # point the whole storage policy depends on. The governor keeps mirrored
+    # previews (the dashboard's visual record) and releases working copies with
+    # the frames, so a full sweep is safe here.
     if verdict.frames_releasable and require_bool(args, "release_frames", True):
         cleanup = governor.cleanup(project_id=project_id)
         payload["storage"] = {

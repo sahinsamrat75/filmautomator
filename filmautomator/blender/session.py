@@ -316,8 +316,56 @@ class BlenderSession:
     def create_primitive(self, kind: str, **kwargs: Any) -> dict:
         return self.call("create_primitive", kind=kind, **kwargs)
 
+    def set_keyframe(self, name: str, **kwargs: Any) -> dict:
+        return self.call("set_keyframe", name=name, **kwargs)
+
+    def get_action_info(self, name: str | None = None, **kwargs: Any) -> dict:
+        args: dict[str, Any] = {}
+        if name is not None:
+            args["name"] = name
+        args.update(kwargs)
+        return self.call("get_action_info", **args)
+
+    def create_empty(self, name: str, **kwargs: Any) -> dict:
+        return self.call("create_empty", name=name, **kwargs)
+
     def set_transform(self, name: str, **kwargs: Any) -> dict:
         return self.call("set_transform", name=name, **kwargs)
+
+    def set_visibility(self, names: list[str], hide_render: bool | None = None,
+                       hide_viewport: bool | None = None) -> dict:
+        args: dict[str, Any] = {"names": names}
+        if hide_render is not None:
+            args["hide_render"] = hide_render
+        if hide_viewport is not None:
+            args["hide_viewport"] = hide_viewport
+        return self.call("set_visibility", **args)
+
+    def link_objects(self, filepath: str | Path, *, names: list[str] | None = None,
+                     prefix: str = "", rename_prefix: str = "") -> dict:
+        return self.call("link_objects", filepath=str(filepath), names=names,
+                         prefix=prefix, rename_prefix=rename_prefix)
+
+    def create_armature(self, name: str, bones: list[dict[str, Any]],
+                        location: tuple[float, float, float] = (0.0, 0.0, 0.0)) -> dict:
+        return self.call("create_armature", name=name, bones=bones,
+                         location=list(location))
+
+    def pose_bone(self, armature: str, bone: str,
+                  rotation_euler: tuple[float, float, float] | None = None,
+                  location: tuple[float, float, float] | None = None,
+                  frame: int | None = None) -> dict:
+        args: dict[str, Any] = {"armature": armature, "bone": bone}
+        if rotation_euler is not None:
+            args["rotation_euler"] = list(rotation_euler)
+        if location is not None:
+            args["location"] = list(location)
+        if frame is not None:
+            args["frame"] = frame
+        return self.call("pose_bone", **args)
+
+    def object_manifest(self, scopes: list[str] | None = None) -> dict:
+        return self.call("object_manifest", scopes=scopes or [])
 
     def delete_objects(self, names: list[str]) -> dict:
         return self.call("delete_object", names=names)

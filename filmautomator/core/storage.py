@@ -457,18 +457,19 @@ class StorageGovernor:
 
     # -- the safety rule ---------------------------------------------------
 
-    def _may_release(self, entry: StorageEntry) -> bool:
+    def _may_release(self, entry: StorageEntry, state: StorageState | None = None) -> bool:
         """Is this specific file safe to delete at this moment?
 
         Protected categories are never released. Everything else is judged by
-        whether the thing it was an intermediate *for* has been verified.
+        whether the thing it was an intermediate *for* has been verified, and
+        -- for preview mirrors -- whether storage pressure actually demands it.
         """
         if entry.category in PROTECTED_CATEGORIES:
             return False
         if entry.category in {CAT_FRAMES, CAT_FAILED}:
             return self._frames_are_releasable(entry)
         if entry.category in {CAT_TEMP, CAT_INTERMEDIATE, CAT_PREVIEW}:
-            return self._intermediate_is_releasable(entry)
+            return self._intermediate_is_releasable(entry, state=state)
         return False
 
     def _frames_are_releasable(self, entry: StorageEntry) -> bool:
@@ -496,7 +497,34 @@ class StorageGovernor:
         # stale-state failure this system exists to prevent.
         return self._registry_matches(project_id, video)
 
-    def _intermediate_is_releasable(self, entry: StorageEntry) -> bool:
+    def _preview_is_releasable(self, entry: StorageEntry,
+                               state: StorageState | None = None) -> bool:
+        """Preview files: the shot's working copy vs. the durable mirror.
+
+        A *working* preview inside ``shots/<id>/v<NNN>/`` is an intermediate of
+        that shot: it may go once the shot's MP4 is verified, alongside the
+        frames. A *mirrored* preview under ``previews/`` is the image the
+        dashboard and the review loop serve from the artifact registry — it is
+        the shot's visual record, so it is only reclaimed when the disk is
+        genuinely under pressure (AGGRESSIVE_CLEANUP/HARD_LIMIT) or after the
+        whole production has a verified final movie.
+        """
+        parts = entry.path.relative_to(self.root).parts
+        is_working_copy = entry.shot_id and (
+            "shots" in parts
+            and any(p.startswith("v") and p[1:].isdigit() for p in parts)
+            and parts[-1].startswith("preview")
+        )
+        if is_working_copy:
+            return self._frames_are_releasable(entry)
+        if state is not None and state in {
+            StorageState.AGGRESSIVE_CLEANUP, StorageState.HARD_LIMIT,
+        }:
+            return True
+        return False
+
+    def _intermediate_is_releasable(self, entry: StorageEntry,
+                                    state: StorageState | None = None) -> bool:
         """Intermediates and temporaries are disposable once the final exists.
 
         The timeline is the subtle case. It is an *input* to the final movie, not
@@ -515,11 +543,11 @@ class StorageGovernor:
             return entry.category == CAT_TEMP
         if self._has_verified_final(project_id):
             return True
+        if entry.category == CAT_PREVIEW and entry.shot_id:
+            return self._preview_is_releasable(entry, state=state)
         if entry.category == CAT_TEMP:
             # Temporary files are always reclaimable; nothing depends on them.
             return True
-        if entry.category == CAT_PREVIEW and entry.shot_id:
-            return self._frames_are_releasable(entry)
         return False
 
     def _verified_shot_video(self, project_id: str, shot_id: str,
@@ -622,6 +650,7 @@ class StorageGovernor:
         so whole frame sets disappear together rather than one file at a time.
         """
         usage = usage or self.measure()
+        state = usage.state
         candidates: list[StorageEntry] = []
         for path in sorted(self.root.rglob("*")):
             if not path.is_file() or path.is_symlink():
@@ -637,22 +666,27 @@ class StorageGovernor:
             entry = StorageEntry(path=path, category=category,
                                  bytes=path.stat().st_size,
                                  shot_id=shot_id, version=version)
-            if self._may_release(entry):
+            if self._may_release(entry, state=state):
                 candidates.append(entry)
         candidates.sort(key=lambda e: -e.bytes)
         return candidates
 
     def cleanup(self, *, target_bytes: int = 0,
                 project_id: str = "",
+                categories: tuple[str, ...] | None = None,
                 dry_run: bool = False) -> dict[str, Any]:
         """Delete only what is provably disposable, then re-measure.
 
         ``target_bytes`` is how much the caller wants back; zero means "clear
-        everything currently safe to remove". Nothing protected and nothing
-        unpromoted is ever touched, regardless of how much space is needed.
+        everything currently safe to remove". ``categories`` narrows the sweep
+        (e.g. frames only after a shot is promoted); None clears every
+        disposable category. Nothing protected and nothing unpromoted is ever
+        touched, regardless of how much space is needed.
         """
         before = self.measure()
         candidates = self.plan_cleanup(before)
+        if categories:
+            candidates = [c for c in candidates if c.category in categories]
         if project_id:
             prefix = self.root / project_id
             candidates = [c for c in candidates

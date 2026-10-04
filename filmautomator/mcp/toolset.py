@@ -22,6 +22,7 @@ from typing import Any
 from ..agents import AgentContext, BlenderAgent, VisionAgent
 from ..agents.director import Director
 from ..core.events import EventKind
+from ..core.finalization import SHOT_FINAL, invalidate_shot
 from ..core.integrity import verify_project
 from ..core.spec import ShotSpec
 from ..core.task import QAStatus, Task, TaskStatus
@@ -707,6 +708,14 @@ def tool_get_shot(ctx: ToolContext, args: dict) -> dict:
                     "description": "eye_level, low, high, birds_eye, worms_eye, "
                                    "dutch or over_shoulder."},
           "lens_mm": {"type": "number"},
+          "movement": {"type": "string",
+                       "description": "static, dolly_in, dolly_out, pan_left, "
+                                      "pan_right, tilt_up, tilt_down, crane_up "
+                                      "or handheld."},
+          "camera_location": {"type": "array", "items": {"type": "number"},
+                              "description": "Explicit [x, y, z] camera position."},
+          "look_at": {"type": "array", "items": {"type": "number"},
+                      "description": "Explicit [x, y, z] point the camera aims at."},
           "lighting_mood": {"type": "string",
                             "description": "natural, golden_hour, blue_hour, "
                                            "overcast, harsh_noon, moonlight, "
@@ -715,6 +724,9 @@ def tool_get_shot(ctx: ToolContext, args: dict) -> dict:
           "environment": {"type": "string"},
           "subject_name": {"type": "string"},
           "subject_height_m": {"type": "number"},
+          "subject_action": {"type": "string",
+                             "description": "idle, walk, enter, reach, lean or "
+                                            "react. Drives the character pose."},
       },
       required=["project_id", "shot_id"])
 def tool_create_shot(ctx: ToolContext, args: dict) -> dict:
@@ -737,12 +749,25 @@ def tool_create_shot(ctx: ToolContext, args: dict) -> dict:
         "subjects": [],
         "quality_criteria": [],
     }
+    if movement := require_str(args, "movement"):
+        spec["camera"]["movement"] = movement
+    if camera_location := args.get("camera_location"):
+        values = [float(v) for v in camera_location][:3]
+        if len(values) == 3:
+            spec["camera"]["location"] = values
+    if look_at := args.get("look_at"):
+        values = [float(v) for v in look_at][:3]
+        if len(values) == 3:
+            spec["camera"]["look_at"] = values
     if name := require_str(args, "subject_name"):
-        spec["subjects"] = [{
+        subject: dict[str, Any] = {
             "name": name,
             "height_m": optional_float(args, "subject_height_m", 1.8) or 1.8,
             "location": [0.0, 0.0, 0.0],
-        }]
+        }
+        if action := require_str(args, "subject_action"):
+            subject["action"] = action
+        spec["subjects"] = [subject]
 
     parsed = ShotSpec.from_dict(spec)
     ctx.db.upsert_shot(project_id, shot_id, parsed.scene_id, parsed.ordinal,
@@ -1128,6 +1153,136 @@ def tool_get_final_movie(ctx: ToolContext, args: dict) -> dict:
         "final_movie": artifact["path"],
         **info,
     })
+
+
+@tool("assemble_movie",
+      "Assemble every FINAL shot video into the finished film, verify it with "
+      "ffprobe, run final QA, and mark the project COMPLETED. Call this after "
+      "each shot has been finalized with finalize_shot. Fails honestly if no "
+      "shot has produced a verified MP4.",
+      properties={"project_id": {"type": "string"}},
+      required=["project_id"])
+def tool_assemble_movie(ctx: ToolContext, args: dict) -> dict:
+    from ..post.ffmpeg import FFmpegError, VideoEncoder
+    from ..qa import FinalQA
+
+    project_id = require_str(args, "project_id")
+    _, workspace = ctx.project_and_workspace(project_id)
+
+    shots = ctx.db.list_shots(project_id)
+    final_shot_ids: list[str] = []
+    shot_videos: list[Path] = []
+    frames_by_shot: dict[str, Path] = {}
+    for shot in shots:
+        if shot.get("status") != SHOT_FINAL:
+            continue
+        artifact = ctx.db.latest_artifact(project_id, "shot_video",
+                                          shot["shot_id"])
+        if artifact is None or not Path(artifact["path"]).is_file():
+            invalidate_shot(ctx.db, project_id, shot["shot_id"],
+                            "shot is marked FINAL but its video is missing",
+                            events=ctx.events)
+            continue
+        final_shot_ids.append(shot["shot_id"])
+        shot_videos.append(Path(artifact["path"]))
+        frames_dir = (artifact.get("metadata") or {}).get("frames_dir")
+        if frames_dir and Path(frames_dir).is_dir():
+            frames_by_shot[shot["shot_id"]] = Path(frames_dir)
+
+    if not shot_videos:
+        return fail(
+            "no FINAL shot videos exist yet; finalize at least one shot with "
+            "finalize_shot before assembling the movie",
+            detail={"final_shots": len(final_shot_ids)},
+        )
+
+    # Re-verify each shot video before it enters the cut: the registry may
+    # point at a file that vanished, and a stale FINAL is not a movie.
+    encoder = VideoEncoder()
+    valid: list[tuple[str, Path]] = []
+    for shot_id, video in zip(final_shot_ids, shot_videos):
+        try:
+            probe = encoder.probe(video)
+            if probe.duration_s <= 0:
+                invalidate_shot(ctx.db, project_id, shot_id,
+                                "shot video failed ffprobe during assembly",
+                                events=ctx.events)
+                continue
+        except FFmpegError:
+            invalidate_shot(ctx.db, project_id, shot_id,
+                            "shot video failed ffprobe during assembly",
+                            events=ctx.events)
+            continue
+        valid.append((shot_id, video))
+    if not valid:
+        return fail(
+            "every final shot failed ffprobe; the timeline is empty. "
+            "Regenerate the affected shots.",
+            detail={"invalidated": final_shot_ids},
+        )
+    final_shot_ids = [s for s, _ in valid]
+    shot_videos = [v for _, v in valid]
+
+    timeline = workspace.editorial_dir / "timeline.mp4"
+    try:
+        if len(shot_videos) == 1:
+            import shutil
+            shutil.copy2(shot_videos[0], timeline)
+        else:
+            encoder.concat(shot_videos, timeline)
+    except FFmpegError as exc:
+        return fail(f"timeline assembly failed: {exc}")
+    ctx.db.register_artifact(project_id, "timeline", str(timeline),
+                             "Assembled picture cut")
+
+    final = workspace.final_video()
+    expected_audio = any(bool(s.get("audio")) for s in shots)
+    try:
+        encoder.mux_audio(timeline, final, audio_tracks=[])
+    except FFmpegError as exc:
+        import shutil
+        shutil.copy2(timeline, final)
+    ctx.db.register_artifact(project_id, "final_movie", str(final),
+                             "Assembled final movie",
+                             metadata={"shots": len(shot_videos),
+                                       "fps": ctx.config.render.fps})
+
+    # Final QA over the real artifact. Rebuild ShotSpecs from the final shots
+    # so the report reflects what is actually in the cut.
+    final_specs: list[ShotSpec] = []
+    for shot_id in final_shot_ids:
+        shot = ctx.db.get_shot(project_id, shot_id)
+        if not shot:
+            continue
+        spec_data = shot.get("spec") or {}
+        spec_data.setdefault("shot_id", shot_id)
+        final_specs.append(ShotSpec.from_dict(spec_data))
+    qa = FinalQA(encoder, fps=ctx.config.render.fps,
+                 width=ctx.config.render.final_width,
+                 height=ctx.config.render.final_height)
+    qa_report = qa.run(final_specs, shot_videos, final,
+                       frames_by_shot=frames_by_shot,
+                       expected_audio=expected_audio,
+                       finalized_shots=set(final_shot_ids))
+
+    probe = encoder.probe(final)
+    payload: dict[str, Any] = {
+        "final": True,
+        "final_movie": str(final),
+        "shots": len(shot_videos),
+        "shot_ids": final_shot_ids,
+        "duration_s": round(probe.duration_s, 2),
+        "resolution": f"{probe.width}x{probe.height}",
+        "fps": round(probe.fps, 2),
+        "codec": probe.video_codec,
+        "size_bytes": Path(final).stat().st_size,
+        "qa_status": "PASSED" if qa_report.passed else "FAILED",
+        "verified": True,
+    }
+    ctx.emit(project_id, EventKind.EDITING_COMPLETED,
+             f"Assembled {len(shot_videos)} shot(s) into the final movie",
+             agent="editorial", payload={"final_movie": str(final)})
+    return ok(payload)
 
 
 # ===========================================================================

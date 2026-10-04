@@ -534,6 +534,27 @@ class ProjectDB:
         )
         return int(row["n"]) + 1 if row else 1
 
+    def next_preview_version(self, project_id: str, shot_id: str) -> int:
+        """The next preview version number for a shot.
+
+        Preview versions are independent of build-version numbers: every
+        ``render_shot_preview`` call advances its own v001/v002/v003 sequence
+        so repeated previews never overwrite each other. Derived from the
+        preview artifacts already registered for the shot.
+        """
+        highest = 0
+        rows = self._query(
+            "SELECT metadata FROM artifacts WHERE project_id=? AND kind='preview'"
+            " AND shot_id=?",
+            (project_id, shot_id),
+        )
+        for row in rows:
+            metadata = json.loads(row["metadata"] or "{}")
+            version = metadata.get("version")
+            if isinstance(version, (int, float)) and int(version) > highest:
+                highest = int(version)
+        return highest + 1
+
     def add_shot_version(self, project_id: str, shot_id: str, *,
                          blend_path: str = "", render_path: str = "",
                          video_path: str = "", qa: dict[str, Any] | None = None,

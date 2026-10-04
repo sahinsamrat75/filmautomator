@@ -147,6 +147,90 @@ def main() -> int:
               f"edges={metrics['edge_density']:.4f}")
         check("histogram has 16 bins", len(metrics["histogram"]) == 16)
 
+        print("canonical builders (Phase 11 of the builders milestone)")
+        from filmautomator.blender.assets import (
+            build_character,
+            build_environment,
+        )
+
+        session.reset_scene(empty=True)
+        session.set_scene_timing(frame_start=1, frame_end=24, fps=24)
+
+        env = build_environment(
+            session, "ENV_COURTYARD_DUSK_01",
+            {"props": ["fountain", "lantern", "archway"], "weather": "clear dusk"},
+        )
+        env_state = session.scene_state()
+        env_names = {o["name"] for o in env_state["objects"]}
+        for expected in ("ENV_COURTYARD_DUSK_01_ground",
+                         "ENV_COURTYARD_DUSK_01_fountain_basin",
+                         "ENV_COURTYARD_DUSK_01_archway_lintel",
+                         "ENV_COURTYARD_DUSK_01_lantern_housing"):
+            check(f"environment object {expected} exists in Blender",
+                  expected in env_names, str(sorted(env_names))[:200])
+        materials = {m["name"] for m in env_state["materials"]}
+        check("environment carries stone material", "ENV_COURTYARD_DUSK_01_MAT_stone" in materials,
+              str(sorted(materials))[:160])
+        manifest = session.object_manifest([env.scope])
+        group = manifest["groups"].get(env.scope) or []
+        check("object manifest lists the environment objects",
+              len(group) >= len(env.objects), f"{len(group)} vs {len(env.objects)}")
+
+        character = build_character(
+            session, "CHR_TRAVELER", "Traveler",
+            {"height_m": 1.8, "clothing": "coat, trousers, boots",
+             "colors": {"coat": "#2b6f6f", "trousers": "#23232a", "boots": "#1d1815"}},
+            location=(0.0, 0.0, 0.0),
+        )
+        character_state = session.scene_state()
+        character_names = {o["name"] for o in character_state["objects"]}
+        for expected in ("CHR_Traveler_head", "CHR_Traveler_torso",
+                         "CHR_Traveler_coat", "CHR_Traveler_arm_L",
+                         "CHR_Traveler_leg_L", "CHR_Traveler_boot_L"):
+            check(f"character object {expected} exists in Blender",
+                  expected in character_names, str(sorted(character_names))[:200])
+        check("character armature has bones",
+              any(o["type"] == "ARMATURE" for o in character_state["objects"]),
+              str([o["type"] for o in character_state["objects"]]))
+        pose = session.pose_bone(character.armature, "upper_arm_R", rotation_euler=(-1.4, 0.0, 0.0))
+        check("pose rotates a bone", "upper_arm_R" in str(pose), str(pose))
+
+        # The character and environment read back as real, render-visible
+        # objects in the manifest — not metadata pretending to be a scene.
+        manifest = session.object_manifest([env.scope, character.scope])
+        env_group = manifest["groups"].get(env.scope) or []
+        character_group = manifest["groups"].get(character.scope) or []
+        check("manifest reflects render-visible environment objects",
+              all(not o["hide_render"] for o in env_group if o["type"] == "MESH"),
+              str(env_group)[:200])
+        check("manifest reflects render-visible character objects",
+              all(not o["hide_render"] for o in character_group if o["type"] == "MESH"),
+              str(character_group)[:200])
+
+        # Camera keyframing records real animation on the shot camera.
+        session.create_camera(name="Cam2", lens_mm=35.0, location=(0, -7, 1.2),
+                              look_at=(0, 0, 1.2), make_active=True)
+        session.set_keyframe(name="Cam2", location=(0, -7, 1.2), frame=1)
+        session.set_keyframe(name="Cam2", location=(0, -5, 1.2), frame=24)
+        info = session.get_action_info("Cam2")
+        check("camera keyframes recorded as animation",
+              info.get("fcurve_count", 0) > 0 and info.get("keyframe_count", 0) > 0,
+              str(info)[:200])
+        print(f"        camera animation: {info.get('keyframe_count')} keyframes")
+
+        session.reset_scene(empty=True)
+        # Restore the standard scene for the sections that follow, which
+        # expect a lit stage with a camera (the builders section cleared it).
+        session.create_primitive("plane", name="Ground", size=50.0)
+        session.create_primitive("cube", name="Box", location=(0, 0, 1))
+        session.create_primitive("sphere", name="Ball", location=(2, 0, 1), radius=0.6)
+        session.create_material("Red", base_color=(0.8, 0.1, 0.1), roughness=0.4)
+        session.assign_material("Red", ["Box", "Ball"])
+        session.create_light(name="Key", light_type="AREA", energy=2000.0,
+                             location=(4, -4, 6), look_at=(0, 0, 1), size=3.0)
+        session.create_camera(name="Cam", lens_mm=50.0, location=(0, -6, 2),
+                              look_at=(0, 0, 1))
+
         print("Workbench limitation is reported, not silent")
         wb = session.set_render_settings(engine="BLENDER_WORKBENCH")
         note = (wb.get("engine_note") or "").lower()

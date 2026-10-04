@@ -2,21 +2,25 @@
 
 This agent owns the Blender session. No other agent drives it.
 
-Honest limitation, stated plainly: this milestone has no character or
-environment *assets* yet, so subjects are built as proxy geometry (a
-blocked-in figure at the right height and position). That is enough for the
-Vision Agent to judge composition, scale, framing and lighting — which is what
-the observe/correct loop needs to function. Importing real canonical character
-assets is the next milestone and the Asset Registry is already shaped for it.
+Canonical assets are real Blender geometry: environments compile from their
+records into meshes, lights and materials, and characters compile into
+segmented humanoids with armatures, named parts and canonical materials. A
+shot instantiates the canonical records its spec references, so continuity is
+structural rather than a naming convention.
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..blender.assets import (
+    build_character,
+    build_environment,
+    pose_character,
+)
 from ..blender.session import BlenderSession
 from ..config import RenderConfig
 from ..core.events import EventKind
@@ -89,6 +93,12 @@ class ShotBuildResult:
     object_count: int
     camera: str
     notes: list[str]
+    #: Every object the build created, so verification can check presence.
+    objects: list[str] = field(default_factory=list)
+    #: Per-part roles, e.g. {"environment": [...], "characters": {...}}.
+    manifest: dict[str, Any] = field(default_factory=dict)
+    #: The camera state read back from Blender after the build.
+    camera_state: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -101,16 +111,35 @@ class PreviewRender:
     plate_note: str = ""
 
 
-def subject_object_names(spec: ShotSpec) -> list[str]:
+def subject_object_names(spec: ShotSpec,
+                         characters: dict[str, dict[str, Any]] | None = None
+                         ) -> list[str]:
     """The scene objects that represent this shot's subjects.
 
-    Names are deterministic — ``_build_subject_proxy`` derives them from the
-    subject name — so the list can be reconstructed from the spec without
-    threading state through the build.
+    Resolved from the Blender manifest when available: canonical characters
+    build a dozen named parts (``CHR_<name>_*``), so the subject is the union
+    of its parts plus its root. Falls back to the legacy two-object names for
+    specs built before canonical characters existed. The root and armature are
+    included so hiding the subject for a background plate removes every
+    render-visible part — a hidden empty parent does not hide its children.
     """
     names: list[str] = []
     for subject in spec.subjects:
-        names.extend([f"{subject.name}_body", f"{subject.name}_head"])
+        built: dict[str, Any] | None = None
+        if characters:
+            built = characters.get(subject.name) or {}
+        parts = [str(p) for p in (built or {}).get("parts") or []]
+        if parts:
+            names.extend(parts)
+            names.append(str(built.get("root") or f"CHR_{subject.name}_root"))
+            armature = built.get("armature")
+            if armature:
+                names.append(str(armature))
+        else:
+            names.extend([
+                f"{subject.name}_body", f"{subject.name}_head",
+                f"CHR_{subject.name}_root",
+            ])
     return names
 
 
@@ -123,6 +152,10 @@ class BlenderAgent(Agent):
         super().__init__(context)
         self.session = session
         self.render = render
+        #: Per-build evidence, consumed by build_shot and verify_build.
+        self._last_environment: dict[str, Any] = {}
+        self._last_characters: dict[str, Any] = {}
+        self._camera_verification: dict[str, Any] = {}
 
     # -- construction ------------------------------------------------------
 
@@ -142,6 +175,9 @@ class BlenderAgent(Agent):
         self.session.reset_scene(empty=True)
 
         self._setup_scene(fps, spec)
+        self._last_environment = {}
+        self._last_characters = {}
+        self._camera_verification = {}
         self._build_environment(spec, notes)
         self._build_subjects(spec, notes)
         self._build_lighting(spec)
@@ -155,6 +191,22 @@ class BlenderAgent(Agent):
         )
 
         state = self.session.scene_state()
+        scopes = []
+        if self._last_environment.get("scope"):
+            scopes.append(self._last_environment["scope"])
+        for built in self._last_characters.values():
+            if built.get("scope"):
+                scopes.append(built["scope"])
+        manifest = self.session.object_manifest(scopes)
+        verification = self.verify_build(spec, state, manifest)
+        if not verification["ok"]:
+            self.log.warning(
+                "build verification failed for %s: %s",
+                spec.shot_id, verification["problems"],
+            )
+            notes.append(
+                "build verification: " + "; ".join(verification["problems"][:4])
+            )
         return ShotBuildResult(
             shot_id=spec.shot_id,
             version=version,
@@ -162,7 +214,115 @@ class BlenderAgent(Agent):
             object_count=state["object_count"],
             camera=state.get("active_camera") or "",
             notes=notes,
+            objects=[o["name"] for o in state.get("objects", [])],
+            manifest={
+                "environment": self._last_environment,
+                "characters": self._last_characters,
+                "camera": self._camera_verification,
+                "verification": verification,
+            },
+            camera_state=self._camera_verification,
         )
+
+    def verify_build(self, spec: ShotSpec, state: dict[str, Any],
+                     manifest: dict[str, Any]) -> dict[str, Any]:
+        """Verify the built scene against the spec, from Blender's own state.
+
+        Blender is authoritative for scene content: the database can claim
+        anything, but only bpy.data proves the objects exist, are visible, and
+        carry materials. Every problem is a concrete missing piece, never a
+        vague verdict.
+        """
+        problems: list[str] = []
+        objects = {o["name"]: o for o in state.get("objects", [])}
+        groups = manifest.get("groups", {})
+
+        # -- camera must exist and be active --------------------------------
+        active = state.get("active_camera")
+        if not active:
+            problems.append("no active camera in the built scene")
+        elif active not in objects:
+            problems.append(f"active camera {active!r} has no scene object")
+
+        # -- environment parts must exist and be render-visible -------------
+        if spec.environment:
+            env_scope = self._last_environment.get("scope", "")
+            env_objects = self._group_members(groups, env_scope)
+            if not env_objects:
+                problems.append(
+                    f"environment {spec.environment!r}: no Blender objects built"
+                )
+            for obj in env_objects:
+                if obj.get("hide_render"):
+                    problems.append(
+                        f"environment object {obj['name']!r} is hidden"
+                    )
+                if obj.get("type") == "MESH" and not obj.get("vertex_count"):
+                    problems.append(
+                        f"environment object {obj['name']!r} has no mesh"
+                    )
+                if obj.get("type") == "MESH" and not any(obj.get("materials") or []):
+                    problems.append(
+                        f"environment object {obj['name']!r} has no material"
+                    )
+
+        # -- character parts must exist and be render-visible ---------------
+        for subject in spec.subjects:
+            built = self._last_characters.get(subject.name) or {}
+            parts = self._group_members(groups, built.get("scope", ""))
+            if not parts:
+                problems.append(
+                    f"subject {subject.name!r}: no Blender objects built"
+                )
+                continue
+            meshes = [p for p in parts if p.get("type") == "MESH"]
+            if len(meshes) < 5:
+                problems.append(
+                    f"subject {subject.name!r}: only {len(meshes)} mesh parts, "
+                    "expected a segmented character"
+                )
+            for obj in parts:
+                if obj.get("hide_render"):
+                    problems.append(
+                        f"character object {obj['name']!r} is render-hidden"
+                    )
+            if not any(p.get("type") == "ARMATURE" for p in parts):
+                problems.append(
+                    f"subject {subject.name!r}: no armature was built"
+                )
+
+        # -- materials for canonical colours --------------------------------
+        material_names = {m.get("name") for m in state.get("materials", [])}
+        for subject in spec.subjects:
+            built = self._last_characters.get(subject.name) or {}
+            scope = built.get("scope", "")
+            expected = f"{scope}_MAT_coat" if scope else ""
+            if expected and expected not in material_names:
+                problems.append(
+                    f"subject {subject.name!r}: canonical coat material "
+                    f"{expected!r} missing"
+                )
+
+        return {"ok": not problems, "problems": problems,
+                "object_count": len(objects),
+                "groups": sorted(groups)}
+
+    @staticmethod
+    def _group_members(groups: dict[str, Any], scope: str) -> list[dict[str, Any]]:
+        """Every manifest entry belonging to ``scope``."""
+        if not scope:
+            return []
+        if scope in groups:
+            return list(groups[scope])
+        found: list[dict[str, Any]] = []
+        for group_name, members in groups.items():
+            if group_name.startswith(scope):
+                found.extend(members)
+        return found
+
+    @staticmethod
+    def _safe_id(value: str) -> str:
+        return "".join(c if (c.isalnum() or c == "_") else "_" for c in value)
 
     # -- scene pieces ------------------------------------------------------
 
@@ -185,93 +345,173 @@ class BlenderAgent(Agent):
         )
 
     def _build_environment(self, spec: ShotSpec, notes: list[str]) -> None:
-        """Ground plane plus a backdrop.
+        """Compile the canonical environment record into real Blender objects.
 
-        Stands in for a real environment asset. It gives the Vision Agent a
-        horizon and something for the key light to fall on, without which
-        framing and exposure are impossible to judge.
+        When the shot references a defined environment (``spec.environment``),
+        the stored record — ground, backdrop, fountain, lantern, archway,
+        layout, materials, lighting baseline — drives the build. Otherwise a
+        neutral stage is built so framing and exposure can still be judged.
         """
-        self.session.create_primitive(
-            "plane", name="ENV_Ground", location=(0.0, 0.0, 0.0), size=200.0,
-        )
-        self.session.create_material(
-            "MAT_Ground", base_color=(0.16, 0.15, 0.14), roughness=0.92, metallic=0.0,
-        )
-        self.session.assign_material("MAT_Ground", ["ENV_Ground"])
-
-        # A backdrop wall keeps the frame from opening onto infinite void.
-        self.session.create_primitive(
-            "plane", name="ENV_Backdrop",
-            location=(0.0, 14.0, 10.0),
-            rotation=(math.radians(90.0), 0.0, 0.0),
-            size=60.0,
-        )
-        self.session.create_material(
-            "MAT_Backdrop", base_color=(0.10, 0.11, 0.14), roughness=1.0,
-        )
-        self.session.assign_material("MAT_Backdrop", ["ENV_Backdrop"])
-
-        if spec.environment:
-            notes.append(
-                f"environment described as {spec.environment!r}; built as a proxy "
-                "stage (ground + backdrop) pending real environment assets"
+        record = self._environment_record(spec.environment)
+        if record is None:
+            scope = "ENV_NeutralStage"
+            self.session.create_primitive(
+                "plane", name=f"{scope}_ground", location=(0.0, 0.0, 0.0),
+                size=200.0,
             )
-        else:
-            notes.append("no environment specified; used a neutral proxy stage")
+            self.session.create_material(
+                "MAT_Ground", base_color=(0.16, 0.15, 0.14), roughness=0.92,
+                metallic=0.0,
+            )
+            self.session.assign_material("MAT_Ground", [f"{scope}_ground"])
+            self.session.create_primitive(
+                "plane", name=f"{scope}_backdrop",
+                location=(0.0, 14.0, 10.0),
+                rotation=(math.radians(90.0), 0.0, 0.0),
+                size=60.0,
+            )
+            self.session.create_material(
+                "MAT_Backdrop", base_color=(0.10, 0.11, 0.14), roughness=1.0,
+            )
+            self.session.assign_material("MAT_Backdrop", [f"{scope}_backdrop"])
+            self._last_environment = {
+                "environment_id": "", "scope": scope,
+                "objects": [f"{scope}_ground", f"{scope}_backdrop"],
+                "materials": ["MAT_Ground", "MAT_Backdrop"], "lights": [],
+                "notes": ["neutral proxy stage"],
+            }
+            if spec.environment:
+                notes.append(
+                    f"no canonical record for environment {spec.environment!r}; "
+                    "built a neutral stage instead"
+                )
+            else:
+                notes.append("no environment specified; used a neutral proxy stage")
+            return
+
+        built = build_environment(
+            self.session, record["environment_id"], record["spec"],
+        )
+        notes.append(
+            f"environment {record['environment_id']}: "
+            f"{len(built.objects)} Blender objects "
+            f"({', '.join(built.objects[:6])}"
+            f"{', …' if len(built.objects) > 6 else ''})"
+        )
+        notes.extend(built.notes)
+        self._last_environment = built.to_dict()
+
+    def _environment_record(self, environment_id: str) -> dict[str, Any] | None:
+        """Load the canonical environment record, if one was defined."""
+        if not environment_id:
+            return None
+        db = self.ctx.db
+        if db is None:
+            return None
+        try:
+            assets = db.find_assets(self.ctx.project_id, "environment")
+        except Exception:  # noqa: BLE001 - a lost registry is not a lost scene
+            return None
+        for asset in assets:
+            metadata = asset.get("metadata") or {}
+            if metadata.get("environment_id") == environment_id:
+                trimmed = {k: v for k, v in metadata.items()
+                           if k != "environment_id"}
+                return {"environment_id": environment_id, "spec": trimmed}
+            if asset.get("name") == environment_id:
+                return {"environment_id": environment_id, "spec": dict(metadata)}
+        return None
 
     def _build_subjects(self, spec: ShotSpec, notes: list[str]) -> None:
         if not spec.subjects:
             notes.append("shot has no subjects; only the stage was built")
             return
 
+        self._last_characters = {}
         for index, subject in enumerate(spec.subjects):
-            self._build_subject_proxy(subject, index)
-            if not subject.asset_id:
-                notes.append(
-                    f"subject {subject.name!r} has no canonical asset yet; "
-                    "represented by proxy geometry"
-                )
+            built = self._build_subject_canonical(subject, index, notes)
+            self._last_characters[subject.name] = built.to_dict()
 
-    def _build_subject_proxy(self, subject: SubjectSpec, index: int) -> None:
-        """A blocked-in humanoid figure: body, head, and a facing marker.
+    def _character_record(self, name: str) -> dict[str, Any] | None:
+        """Load the canonical character record, if one was defined."""
+        db = self.ctx.db
+        if db is None:
+            return None
+        try:
+            return db.get_character(self.ctx.project_id, name)
+        except Exception:  # noqa: BLE001
+            return None
 
-        Deliberately crude. Its job is to occupy the right volume of frame at
-        the right height so framing, scale and lighting can be evaluated.
+    def _build_subject_canonical(
+        self, subject: SubjectSpec, index: int, notes: list[str],
+    ):
+        """Build a subject from its canonical character record.
+
+        The canonical definition — proportions, clothing, colors, materials —
+        drives the geometry. The subject's shot-level location, scale and action
+        place and pose it. A subject with no canonical record falls back to a
+        visible proxy block so an undefined name is still present rather
+        than absent.
         """
-        height = max(0.2, float(subject.height_m))
-        x, y, z = subject.location
+        record = self._character_record(subject.name)
+        canonical = dict(record.get("canonical") or {}) if record else {}
+        # The shot's height wins when the record is silent; the record wins
+        # when the shot restates nothing. Either way the number is explicit.
+        if subject.height_m and not canonical.get("height_m"):
+            canonical["height_m"] = float(subject.height_m)
+        colors = dict(canonical.get("colors") or {})
+        if subject.appearance and "appearance_note" not in colors:
+            colors["appearance_note"] = subject.appearance
+        canonical["colors"] = colors
+        if subject.action and "action_note" not in canonical:
+            canonical = dict(canonical)
+            canonical["action_note"] = subject.action
+
+        character_id = ((record or {}).get("character_id", "")
+                        or subject.asset_id or "")
+        built = build_character(
+            self.session, character_id, subject.name, canonical,
+            location=tuple(subject.location),
+        )
+
+        # Shot-level scale on the root handle; the parts inherit through
+        # parenting rather than being rebuilt per shot.
         sx, sy, sz = subject.scale
+        if (sx, sy, sz) != (1.0, 1.0, 1.0):
+            self.session.set_transform(built.root, scale=(sx, sy, sz))
 
-        body_height = height * 0.78
-        head_radius = height * 0.11
-        # Blocky shoulders so the silhouette reads as a figure, not a post.
-        body_width = height * 0.26 * sx
-
-        self.session.create_primitive(
-            "cube", name=f"{subject.name}_body",
-            location=(x, y, z + body_height / 2.0),
-            scale=(body_width / 2.0, height * 0.10 * sy, body_height / 2.0),
-        )
-        self.session.create_primitive(
-            "sphere", name=f"{subject.name}_head",
-            location=(x, y, z + body_height + head_radius * 0.9),
-            radius=head_radius * sx,
+        notes.append(
+            f"subject {subject.name!r}: canonical character with "
+            f"{len(built.parts)} parts and {len(built.bones)} bones "
+            f"(record={'defined' if record else 'proxy fallback'})"
         )
 
-        entry_material = f"MAT_{subject.name}"
-        # A distinct hue per subject makes them tellable apart in a preview,
-        # which matters when the Vision Agent reports "subject A occludes B".
-        palette = [
-            (0.55, 0.32, 0.24), (0.24, 0.36, 0.55), (0.30, 0.48, 0.32),
-            (0.52, 0.44, 0.22), (0.44, 0.26, 0.46),
-        ]
-        color = palette[index % len(palette)]
-        self.session.create_material(
-            entry_material, base_color=color, roughness=0.72, metallic=0.0,
-        )
-        self.session.assign_material(
-            entry_material, [f"{subject.name}_body", f"{subject.name}_head"]
-        )
+        # The shot's action selects a deterministic pose.
+        pose = self._pose_for_action(subject.action)
+        try:
+            pose_character(self.session, built.armature, pose, frame=None)
+            notes.append(f"{subject.name!r} posed: {pose}")
+        except Exception as exc:  # noqa: BLE001 - a pose must not fail a build
+            notes.append(f"{subject.name!r} pose {pose!r} skipped: {exc}")
+        return built
+
+    @staticmethod
+    def _pose_for_action(action: str) -> str:
+        """Map a shot action onto the deterministic pose vocabulary."""
+        text = (action or "").lower()
+        if any(word in text for word in ("walk", "stride", "approach", "cross")):
+            return "walk"
+        if any(word in text for word in ("enter", "arrive", "step in")):
+            return "enter"
+        if any(word in text for word in ("reach", "touch", "take", "grasp",
+                                         "lift")):
+            return "reach"
+        if any(word in text for word in ("lean", "rest", "slump")):
+            return "lean"
+        if any(word in text for word in ("react", "startle", "turn", "look",
+                                         "surprise", "fear", "gasp")):
+            return "react"
+        return "idle"
 
     def _build_lighting(self, spec: ShotSpec) -> None:
         light = spec.lighting
@@ -306,7 +546,7 @@ class BlenderAgent(Agent):
 
     def _build_camera(self, spec: ShotSpec) -> None:
         location, look_at, lens = self._solve_camera(spec)
-        self.session.create_camera(
+        created = self.session.create_camera(
             name="CAM_Main",
             lens_mm=lens,
             location=location,
@@ -315,54 +555,194 @@ class BlenderAgent(Agent):
             fstop=spec.camera.fstop,
             make_active=True,
         )
+        # Read the camera back and compare against the *applied* placement, not
+        # the raw spec values. When the spec left the camera to be solved, the
+        # solved position is the intent; comparing against the untouched
+        # dataclass default would report a drift that never happened. What this
+        # catches is Blender silently keeping its own default instead of using
+        # what was asked for.
+        self._camera_verification = self.verify_camera(
+            spec, created, intended_location=location, intended_lens=lens,
+            tolerance_m=0.05, tolerance_lens=0.5,
+        )
+        if not self._camera_verification["ok"]:
+            self.log.warning(
+                "camera verification failed for %s: %s",
+                spec.shot_id, self._camera_verification["problems"],
+            )
+        # Movement becomes real keyframes on the camera, including an explicit
+        # static hold so STATIC is a deliberate state rather than an accident.
+        # Start from the *applied* location — the solved position when the spec
+        # left the camera to be framed, the explicit position when it asked for
+        # one — never the dataclass default, which would yank the camera away
+        # from the solved framing.
+        keyframes = self._keyframe_camera(
+            spec, created.get("name", "CAM_Main"), start=location,
+        )
+        if keyframes:
+            self._camera_verification["keyframes"] = keyframes
+
+    def verify_camera(self, spec: ShotSpec, created: dict[str, Any],
+                      intended_location: tuple[float, float, float] | None = None,
+                      intended_lens: float | None = None,
+                      tolerance_m: float = 0.05,
+                      tolerance_lens: float = 0.5) -> dict[str, Any]:
+        """Compare the intended camera against what Blender actually reports.
+
+        Returns ``ok`` plus the per-field deltas. Anything outside tolerance is
+        a problem, not a rounding wobble — silently substituting a default
+        camera is a build failure, and it is reported as one.
+        """
+        want_location = tuple(
+            float(v) for v in (intended_location or spec.camera.location)
+        )
+        want_lens = float(
+            intended_lens if intended_lens is not None
+            else (spec.camera.lens_mm or 0.0)
+        )
+        got_location = tuple(created.get("location") or (0.0, 0.0, 0.0))
+        got_lens = float(created.get("lens_mm") or 0.0)
+        got_rotation = tuple(created.get("rotation_euler") or (0.0, 0.0, 0.0))
+
+        problems: list[str] = []
+        location_delta = math.dist(want_location, got_location)
+        if location_delta > tolerance_m:
+            problems.append(
+                f"location drifted {location_delta:.3f} m "
+                f"(want {want_location}, got {got_location})"
+            )
+        if want_lens and abs(want_lens - got_lens) > tolerance_lens:
+            problems.append(
+                f"lens is {got_lens:.1f} mm, spec asked {want_lens:.1f} mm"
+            )
+        return {
+            "ok": not problems,
+            "problems": problems,
+            "requested": {"location": want_location,
+                          "look_at": tuple(float(v) for v in spec.camera.look_at),
+                          "lens_mm": want_lens, "movement": spec.camera.movement},
+            "actual": {"location": got_location, "rotation_euler": got_rotation,
+                       "lens_mm": got_lens},
+            "location_delta_m": round(location_delta, 4),
+        }
+
+    def _keyframe_camera(self, spec: ShotSpec, camera_name: str,
+                         start: tuple[float, float, float] | None = None
+                         ) -> list[dict]:
+        """Keyframe camera movement; an explicit hold when STATIC.
+
+        Dolly/pan/tilt/crane/handheld become start/end keyframes on location so
+        the final render actually moves. STATIC keys a single hold frame so the
+        camera is provably still rather than accidentally unkeyed.
+
+        ``start`` is the camera position already applied to Blender (solved or
+        explicit). It is never the spec's raw default, which would displace the
+        camera from its solved framing.
+        """
+        movement = (spec.camera.movement or "static").lower()
+        frames = max(1, spec.frame_count_at(self.render.fps))
+        keyframes: list[dict] = []
+
+        def key(frame: int, location: tuple) -> None:
+            self.session.set_transform(camera_name, location=list(location))
+            self.session.call("set_keyframe", name=camera_name,
+                              location=list(location), frame=frame)
+            keyframes.append({"frame": frame, "location": list(location)})
+
+        start_location = tuple(
+            float(v) for v in (start if start is not None else spec.camera.location)
+        )
+        end = self._movement_end(spec, start_location)
+        if movement == "static" or end is None:
+            key(1, start_location)
+            return keyframes
+        key(1, start_location)
+        key(frames, end)
+        return keyframes
+
+    @staticmethod
+    def _movement_end(spec: ShotSpec,
+                      start: tuple[float, float, float]) -> tuple | None:
+        """Where the camera should be on the last frame of a move."""
+        movement = (spec.camera.movement or "static").lower()
+        look_at = tuple(float(v) for v in spec.camera.look_at)
+        sx, sy, sz = start
+        if movement == "dolly_in":
+            return (sx, sy * 0.75, sz)
+        if movement == "dolly_out":
+            return (sx, sy * 1.25, sz)
+        if movement == "truck_left":
+            return (sx - 1.5, sy, sz)
+        if movement == "truck_right":
+            return (sx + 1.5, sy, sz)
+        if movement == "pan_left":
+            return start
+        if movement == "pan_right":
+            return start
+        if movement == "tilt_up":
+            return (sx, sy, sz + 0.8)
+        if movement == "tilt_down":
+            return (sx, sy, sz - 0.8)
+        if movement == "crane_up":
+            return (sx, sy * 1.1, sz + 1.5)
+        if movement == "handheld":
+            return (sx + 0.12, sy - 0.1, sz + 0.08)
+        if movement == "static":
+            return None
+        return None
 
     def _solve_camera(
         self, spec: ShotSpec
     ) -> tuple[tuple[float, float, float], tuple[float, float, float], float]:
         """Derive camera placement from shot size, angle and the subject.
 
-        Solves the thin-lens framing equation so the subject occupies the
-        intended fraction of frame height:  distance = framing_height * f / sensor_height.
+        The spec's explicit location and lens always win. Only when the spec
+        carries defaults (location untouched, lens unset) is the framing
+        equation solved from shot size and angle. An AI that asked for a camera
+        at (0, -7, 2) with a 35mm lens gets exactly that — never a silently
+        substituted solve.
         """
         camera = spec.camera
         subject = spec.subjects[0] if spec.subjects else None
 
+        # An explicitly placed camera is a directorial decision, not a default
+        # to be solved away. The dataclass default is (0, -6, 1.6); anything
+        # else was asked for on purpose.
+        explicit_location = tuple(camera.location) != (0.0, -6.0, 1.6)
+        explicit_look = tuple(camera.look_at) != (0.0, 0.0, 1.0)
+        explicit_lens = bool(camera.lens_mm)
+
         if subject is not None:
             look_height = _LOOK_AT_HEIGHT.get(camera.shot_size, 0.58)
-            look_at = (
+            solved_look = (
                 subject.location[0],
                 subject.location[1],
                 subject.location[2] + subject.height_m * look_height,
             )
             height = max(0.2, subject.height_m)
         else:
-            look_at = (0.0, 0.0, 1.0)
+            solved_look = (0.0, 0.0, 1.0)
             height = 1.8
+        look_at = tuple(camera.look_at) if explicit_look else solved_look
 
-        fill = _FILL_RATIO.get(camera.shot_size, 0.80)
-        framing_height = height / fill
-        lens = float(camera.lens_mm or _DEFAULT_LENS.get(camera.shot_size, 50.0))
-
-        aspect = self.render.preview_width / max(1, self.render.preview_height)
-        # Blender's AUTO sensor fit maps sensor_width onto the larger axis.
-        sensor_height = 36.0 / aspect if aspect >= 1.0 else 36.0
-        distance = (framing_height * lens) / max(1e-6, sensor_height)
-        distance = max(0.35, distance)
-
-        dz = _ANGLE_HEIGHT.get(camera.angle, 0.0) * (height / 1.8)
-        # Slight lateral offset for over-the-shoulder so the near figure sits
-        # at frame edge rather than dead centre.
-        dx = -0.55 * height if camera.angle == "over_shoulder" else 0.0
-        if camera.angle == "birds_eye":
-            dy = -distance * 0.35
+        if explicit_location:
+            location = tuple(float(v) for v in camera.location)
         else:
-            dy = -distance
+            fill = _FILL_RATIO.get(camera.shot_size, 0.80)
+            framing_height = height / fill
+            distance = (framing_height * float(camera.lens_mm or 50.0))
+            aspect = self.render.preview_width / max(1, self.render.preview_height)
+            sensor_height = 36.0 / aspect if aspect >= 1.0 else 36.0
+            distance = max(0.35, distance / max(1e-6, sensor_height))
+            dz = _ANGLE_HEIGHT.get(camera.angle, 0.0) * (height / 1.8)
+            dx = -0.55 * height if camera.angle == "over_shoulder" else 0.0
+            if camera.angle == "birds_eye":
+                dy = -distance * 0.35
+            else:
+                dy = -distance
+            location = (look_at[0] + dx, look_at[1] + dy, look_at[2] + dz)
 
-        location = (
-            look_at[0] + dx,
-            look_at[1] + dy,
-            look_at[2] + dz,
-        )
+        lens = float(camera.lens_mm or _DEFAULT_LENS.get(camera.shot_size, 50.0))
         return location, look_at, lens
 
     # -- rendering ---------------------------------------------------------
@@ -403,7 +783,7 @@ class BlenderAgent(Agent):
         if note:
             self.log.warning("preview render settings: %s", note)
 
-        names = subject_object_names(spec)
+        names = subject_object_names(spec, self._last_characters)
         if names:
             plate_path = ws.shot_preview_plate(spec.shot_id, version)
             try:
@@ -432,18 +812,23 @@ class BlenderAgent(Agent):
                 plate_path = None
 
         # The dashboard and the Vision Agent must look at the same pixels, so
-        # the preview is registered and mirrored the moment it exists.
+        # the preview is registered and mirrored the moment it exists. The
+        # artifact points at the *mirrored* copy under previews/ — the durable
+        # visual record the dashboard serves — not the in-shot working copy,
+        # which the storage governor releases with its frames once the shot is
+        # promoted.
+        mirrored = ws.mirror_preview(spec.shot_id, version)
+        artifact_path = str(mirrored or path)
         artifact_id = self.ctx.db.register_artifact(
-            self.ctx.project_id, "preview", str(path),
+            self.ctx.project_id, "preview", artifact_path,
             f"{spec.shot_id} v{version:03d} preview",
             shot_id=spec.shot_id, scene_id=spec.scene_id,
-            metadata={"version": version, **result},
+            metadata={"version": version, "working_copy": str(path), **result},
         )
-        ws.mirror_preview(spec.shot_id, version)
         self.emit(EventKind.PREVIEW_READY,
                   f"Preview ready for {spec.shot_id} (v{version:03d})",
                   task=task, shot_id=spec.shot_id, scene_id=spec.scene_id,
-                  payload={"path": str(path), "artifact_id": artifact_id,
+                  payload={"path": artifact_path, "artifact_id": artifact_id,
                            "version": version})
 
         return PreviewRender(

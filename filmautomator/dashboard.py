@@ -138,6 +138,18 @@ class DashboardState:
         latest_final = db.latest_artifact(pid, "final_movie")
         pending = db.pending_decisions(pid)
 
+        # The dashboard must only advertise artifacts that still exist on disk.
+        # A preview the storage governor reclaimed under pressure is a registry
+        # row with no file behind it; serving it would 410.
+        preview_present = bool(
+            latest_preview and latest_preview.get("exists")
+            and Path(latest_preview["path"]).is_file()
+        )
+        final_present = bool(
+            latest_final and latest_final.get("exists")
+            and Path(latest_final["path"]).is_file()
+        )
+
         by_status: dict[str, int] = {}
         for task in tasks:
             by_status[task.status.value] = by_status.get(task.status.value, 0) + 1
@@ -190,13 +202,13 @@ class DashboardState:
                 "artifact_id": latest_preview["artifact_id"],
                 "shot_id": latest_preview["shot_id"],
                 "created_at": latest_preview["created_at"],
-            } if latest_preview else None,
+            } if preview_present else None,
             "final_movie": {
                 "artifact_id": latest_final["artifact_id"],
                 "path": latest_final["path"],
                 "bytes": latest_final["bytes"],
                 "created_at": latest_final["created_at"],
-            } if latest_final else None,
+            } if final_present else None,
             # The same storage measurement the MCP tool reports, so the
             # dashboard can never show a different disk story than the AI sees.
             "storage": self.storage_state(),

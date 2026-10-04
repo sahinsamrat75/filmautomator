@@ -220,14 +220,30 @@ def op_get_scene_state(_args: dict) -> dict:
         if o.type == "ARMATURE"
     ]
 
-    actions = [
-        {
+    actions = []
+    for a in bpy.data.actions:
+        try:
+            fcurves = list(a.fcurves)
+        except AttributeError:
+            # Blender 5.x layered actions expose channels, not fcurves.
+            fcurves = []
+            try:
+                for layer in a.layers:
+                    for strip in layer.strips:
+                        channelbag = getattr(strip, "channelbag", lambda: None)()
+                        if channelbag is not None:
+                            fcurves.extend(list(channelbag.fcurves))
+            except Exception:
+                pass
+        try:
+            frame_range = _to_list(a.frame_range)
+        except Exception:
+            frame_range = []
+        actions.append({
             "name": a.name,
-            "frame_range": _to_list(a.frame_range),
-            "fcurve_count": len(a.fcurves),
-        }
-        for a in bpy.data.actions
-    ]
+            "frame_range": frame_range,
+            "fcurve_count": len(fcurves),
+        })
 
     constraints = [
         {
@@ -417,6 +433,78 @@ def op_set_transform(args: dict) -> dict:
     }
 
 
+def op_set_visibility(args: dict) -> dict:
+    """Show or hide objects in the viewport and/or the render.
+
+    Returns what was actually set, read back from Blender, so the caller can
+    confirm the scene matches what was asked rather than assume it.
+    """
+    hide_render = args.get("hide_render")
+    hide_viewport = args.get("hide_viewport")
+    changed = []
+    for name in args.get("names", []):
+        obj = bpy.data.objects.get(name)
+        if obj is None:
+            continue
+        if hide_render is not None:
+            obj.hide_render = bool(hide_render)
+        if hide_viewport is not None:
+            obj.hide_viewport = bool(hide_viewport)
+        changed.append({
+            "name": obj.name,
+            "hide_render": bool(obj.hide_render),
+            "hide_viewport": bool(obj.hide_viewport),
+        })
+    missing = [n for n in args.get("names", [])
+               if bpy.data.objects.get(n) is None]
+    return {"changed": changed, "not_found": missing}
+
+
+def op_link_objects(args: dict) -> dict:
+    """Instantiate objects from a canonical asset .blend into this scene.
+
+    The library file is the single source of truth for the asset; shots link
+    (copy) its objects rather than rebuilding them. ``names`` selects which
+    objects to bring in — omit it to bring in everything whose name starts with
+    ``prefix``. Linked objects are renamed with ``rename_prefix`` so two shots'
+    instances never collide.
+    """
+    filepath = os.path.abspath(args["filepath"])
+    if not os.path.exists(filepath):
+        raise FileNotFoundError(filepath)
+    names = args.get("names")
+    prefix = args.get("prefix", "")
+    rename_prefix = args.get("rename_prefix", "")
+    linked = []
+    with bpy.data.libraries.load(filepath, link=False) as (src, dst):
+        available = list(src.objects)
+        if names is None:
+            if prefix:
+                wanted = [n for n in available if n.startswith(prefix)]
+            else:
+                wanted = list(available)
+        else:
+            wanted = [n for n in names if n in available]
+            missing = [n for n in names if n not in available]
+            if missing:
+                raise KeyError("library %s has no objects %r" % (filepath, missing))
+        dst.objects = wanted
+    for obj in dst.objects:
+        if obj is None:
+            continue
+        bpy.context.scene.collection.objects.link(obj)
+        if rename_prefix:
+            obj.name = rename_prefix + obj.name
+            if obj.data:
+                try:
+                    obj.data.name = obj.name
+                except Exception:
+                    pass
+        linked.append(obj.name)
+    return {"filepath": filepath, "linked": sorted(linked),
+            "linked_count": len(linked)}
+
+
 def op_duplicate_object(args: dict) -> dict:
     src = _object_ref(args["name"])
     clone = src.copy()
@@ -567,6 +655,124 @@ def op_create_camera(args: dict) -> dict:
     }
 
 
+def op_create_armature(args: dict) -> dict:
+    """Build a simple armature from a bone list.
+
+    bones: [{name, head: [x,y,z], tail: [x,y,z], parent: name-or-empty}].
+    Modest on purpose: a rig is a posing handle, and a handful of named bones
+    posed deterministically is more reliable than an elaborate rig built blind.
+    """
+    bpy.ops.object.armature_add(
+        enter_editmode=True,
+        location=args.get("location", (0.0, 0.0, 0.0)),
+    )
+    arm = bpy.context.active_object
+    if name := args.get("name"):
+        arm.name = name
+        arm.data.name = name
+    bones = args.get("bones", [])
+    created = []
+    edit = arm.data.edit_bones
+    # The default armature ships with one bone; reshape it into the first bone
+    # so the armature never carries a stray unnamed extra.
+    first = edit[0] if len(edit) else None
+    for index, spec in enumerate(bones):
+        if index == 0 and first is not None:
+            bone = first
+        else:
+            bone = edit.new(spec["name"])
+        bone.name = spec["name"]
+        bone.head = spec["head"]
+        bone.tail = spec["tail"]
+        created.append(bone.name)
+    for spec in bones:
+        parent = spec.get("parent")
+        if parent and parent in edit and spec["name"] in edit:
+            edit[spec["name"]].parent = edit[parent]
+    bpy.ops.object.mode_set(mode="OBJECT")
+    return {"name": arm.name, "bones": created, "bone_count": len(created)}
+
+
+def op_pose_bone(args: dict) -> dict:
+    """Rotate/translate a pose bone and optionally keyframe it.
+
+    rotation_euler is in radians, applied in the bone's local space.
+    """
+    arm = _object_ref(args["armature"])
+    if arm.type != "ARMATURE":
+        raise ValueError("%r is a %s, not an armature" % (arm.name, arm.type))
+    bone = arm.pose.bones.get(args["bone"])
+    if bone is None:
+        raise KeyError("armature %r has no bone %r" % (arm.name, args["bone"]))
+    keyed = []
+    frame = args.get("frame")
+    if rotation := args.get("rotation_euler"):
+        bone.rotation_mode = "XYZ"
+        bone.rotation_euler = rotation
+        if frame is not None:
+            bone.keyframe_insert(data_path="rotation_euler", frame=int(frame))
+            keyed.append("rotation_euler")
+    if location := args.get("location"):
+        bone.location = location
+        if frame is not None:
+            bone.keyframe_insert(data_path="location", frame=int(frame))
+            keyed.append("location")
+    return {"armature": arm.name, "bone": bone.name,
+            "rotation_euler": _to_list(bone.rotation_euler),
+            "location": _to_list(bone.location), "keyed": keyed,
+            "frame": frame}
+
+
+def op_object_manifest(args: dict) -> dict:
+    """The objects in this scene, grouped by scope.
+
+    Grouping is exact rather than heuristic. Structural names such as
+    ``ENV_COURTYARD_DUSK_01_fountain_basin`` cannot be split reliably by
+    underscores — the environment id and the part name both contain them — so
+    the caller passes the scopes it knows it built (``scopes``) and each object
+    is matched against the longest one that prefixes it. That makes an entry in
+    a group proof that the corresponding Blender object exists.
+    """
+    scopes = [str(s) for s in (args.get("scopes") or []) if str(s)]
+    # Longest first, so ENV_A_B matches ENV_A_B before ENV_A.
+    scopes.sort(key=len, reverse=True)
+
+    groups: dict = {}
+    for obj in bpy.data.objects:
+        name = obj.name
+        prefix = ""
+        for scope in scopes:
+            if name == scope or name.startswith(scope + "_"):
+                prefix = scope
+                break
+        if not prefix:
+            if name.startswith("CHR_") and "_" in name:
+                prefix = "CHR_" + name.split("_")[1]
+            elif "_" in name:
+                prefix = name.split("_")[0] + "_"
+            else:
+                prefix = "(none)"
+        entry = {
+            "name": name,
+            "type": obj.type,
+            "location": _to_list(obj.location),
+            "hide_render": bool(obj.hide_render),
+            "hide_viewport": bool(obj.hide_viewport),
+            "parent": obj.parent.name if obj.parent else None,
+        }
+        if obj.type == "MESH" and obj.data is not None:
+            entry["vertex_count"] = len(obj.data.vertices)
+            entry["materials"] = [
+                slot.material.name if slot.material else None
+                for slot in obj.material_slots
+            ]
+        groups.setdefault(prefix, []).append(entry)
+    return {"groups": groups,
+            "group_names": sorted(groups),
+            "scopes": scopes,
+            "object_count": len(bpy.data.objects)}
+
+
 def op_set_active_camera(args: dict) -> dict:
     obj = _object_ref(args["name"])
     if obj.type != "CAMERA":
@@ -578,6 +784,168 @@ def op_set_active_camera(args: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Animation
 # ---------------------------------------------------------------------------
+
+
+def _action_animation_summary(action) -> dict:
+    """Count real keyframe data inside an action, across storage formats.
+
+    Blender 4.x keeps fcurves directly on the action. Blender 5.x moved to
+    layered actions (action.layers -> strips -> channelbags) and the classic
+    ``action.fcurves`` is empty. Rather than trusting either surface, this
+    walks whatever the installed version exposes and counts keyframe points,
+    so ``fcurve_count: 0`` really means "no animation", never "I could not
+    find the animation".
+    """
+    import bpy  # noqa: F401
+    total_kf = 0
+    channels = 0
+    frame_min: float | None = None
+    frame_max: float | None = None
+
+    def count_fcurves(fcurves) -> None:
+        nonlocal total_kf, channels, frame_min, frame_max
+        for fc in fcurves:
+            channels += 1
+            for kp in fc.keyframe_points:
+                total_kf += 1
+                f = float(kp.co[0])
+                if frame_min is None or f < frame_min:
+                    frame_min = f
+                if frame_max is None or f > frame_max:
+                    frame_max = f
+
+    try:
+        count_fcurves(list(action.fcurves))
+    except (AttributeError, TypeError):
+        pass
+
+    # Layered actions (Blender 5.x): keyframes live in channelbags inside
+    # layer strips rather than on the action's own fcurve collection. The
+    # channelbag is indexed by the slot that holds the animated datablock, so
+    # ``channelbag(slot)`` is the correct call.
+    layers = getattr(action, "layers", None)
+    if layers is not None:
+        slots = None
+        try:
+            slots = list(action.slots) if hasattr(action, "slots") else None
+        except Exception:
+            slots = None
+        try:
+            for layer in layers:
+                for strip in layer.strips:
+                    channelbag = None
+                    try:
+                        if slots:
+                            channelbag = strip.channelbag(slots[0])
+                        else:
+                            channelbag = strip.channelbag()
+                    except TypeError:
+                        channelbag = None
+                    if channelbag is None:
+                        continue
+                    try:
+                        count_fcurves(channelbag.fcurves)
+                    except (AttributeError, TypeError):
+                        continue
+        except Exception:
+            pass
+
+    return {
+        "name": action.name,
+        "fcurve_count": channels,
+        "keyframe_count": total_kf,
+        "frame_range": [frame_min, frame_max] if frame_min is not None else [],
+        "storage": "layered" if layers is not None else "legacy",
+    }
+
+
+def op_get_action_info(args: dict) -> dict:
+    """Report the animation attached to one object, in the form that verifies.
+
+    Used to prove a requested movement became actual keyframes (or that a
+    static hold is deliberately keyed to a single frame), read from Blender's
+    own animation data rather than assumed from the spec.
+    """
+    obj_name = args.get("name")
+    if obj_name is not None:
+        obj = _object_ref(obj_name)
+        adata = obj.animation_data
+        if adata is None or adata.action is None:
+            return {"name": obj_name, "action": None,
+                    "animation_count": 0, "note": "no animation data"}
+        summary = _action_animation_summary(adata.action)
+        summary["object"] = obj_name
+        summary["action"] = adata.action.name
+        if args.get("dump"):
+            summary["debug"] = _action_debug_dump(adata.action)
+        return summary
+    all_actions = [_action_animation_summary(a) for a in bpy.data.actions]
+    return {"actions": all_actions, "count": len(all_actions)}
+
+
+def _action_debug_dump(action) -> dict:
+    """Inspect the raw action internals, for diagnosing the readback."""
+    info = {
+        "type": type(action).__name__,
+        "has_fcurves": hasattr(action, "fcurves"),
+        "attrs": [a for a in dir(action)
+                  if not a.startswith("_") and a not in ("is_valid", "library", "use_fake_user", "tag")]
+    }
+    try:
+        info["fcurve_count_attr"] = len(list(action.fcurves))
+    except Exception as exc:  # noqa: BLE001
+        info["fcurve_error"] = repr(exc)
+    layers = getattr(action, "layers", None)
+    info["has_layers"] = layers is not None
+    if layers is not None:
+        try:
+            info["num_layers"] = len(layers)
+            info["layer_attrs"] = [a for a in dir(layers[0]) if not a.startswith("_")]
+            strip_objs = []
+            for layer in layers:
+                for strip in layer.strips:
+                    entry = {
+                        "type": type(strip).__name__,
+                        "attrs": [a for a in dir(strip) if not a.startswith("_")
+                                  and a not in ("is_valid", "tag", "library")],
+                    }
+                    cb = None
+                    for attr in ("channelbag", "channelbags"):
+                        raw = getattr(strip, attr, None)
+                        if callable(raw):
+                            raw = raw()
+                        if raw is not None:
+                            cb = raw
+                            entry["channelbag_attr"] = attr
+                            break
+                    if cb is not None:
+                        entry["channelbag_type"] = type(cb).__name__
+                        entry["channelbag_attrs"] = [
+                            a for a in dir(cb)
+                            if not a.startswith("_")
+                            and a not in ("is_valid", "tag", "library", "user_clear", "user_remap", "users")]
+                        try:
+                            entry["cb_fcurves"] = len(list(cb.fcurves))
+                        except Exception as exc:  # noqa: BLE001
+                            entry["cb_fcurve_error"] = repr(exc)
+                    else:
+                        entry["channelbag"] = None
+                    strip_objs.append(entry)
+            info["strips"] = strip_objs
+        except Exception as exc:  # noqa: BLE001
+            info["layers_error"] = repr(exc)
+    slots = getattr(action, "slots", None)
+    info["has_slots"] = slots is not None
+    if slots is not None:
+        try:
+            info["num_slots"] = len(slots)
+            info["slot_attrs"] = [
+                {"name": s.name, "attrs": [a for a in dir(s) if not a.startswith("_")]}
+                for s in slots
+            ]
+        except Exception as exc:  # noqa: BLE001
+            info["slots_error"] = repr(exc)
+    return info
 
 
 def op_set_keyframe(args: dict) -> dict:
@@ -1123,17 +1491,23 @@ OPERATIONS = {
     "shutdown": op_shutdown,
     "get_scene_state": op_get_scene_state,
     "get_errors": op_get_errors,
+    "object_manifest": op_object_manifest,
     "create_primitive": op_create_primitive,
     "create_empty": op_create_empty,
     "delete_object": op_delete_object,
     "set_transform": op_set_transform,
+    "set_visibility": op_set_visibility,
+    "link_objects": op_link_objects,
     "duplicate_object": op_duplicate_object,
+    "create_armature": op_create_armature,
+    "pose_bone": op_pose_bone,
     "create_material": op_create_material,
     "assign_material": op_assign_material,
     "create_light": op_create_light,
     "create_camera": op_create_camera,
     "set_active_camera": op_set_active_camera,
     "set_keyframe": op_set_keyframe,
+    "get_action_info": op_get_action_info,
     "set_scene_timing": op_set_scene_timing,
     "set_render_settings": op_set_render_settings,
     "render_still": op_render_still,
