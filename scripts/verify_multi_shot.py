@@ -48,6 +48,39 @@ PASSED = 0
 FAILED = 0
 
 
+def wait_for_render_job(client, project_id: str, shot_id: str, *,
+                        timeout_s: float = 3600.0,
+                        poll_s: float = 10.0) -> tuple[dict | None, dict]:
+    """Poll get_render until the shot's job is terminal.
+
+    Each poll also times a ``list_projects`` round-trip: the render lifecycle
+    exists precisely so the control plane stays responsive, and this makes
+    that a measured assertion rather than an assumption.
+    """
+    deadline = time.time() + timeout_s
+    job: dict = {}
+    slowest = 0.0
+    while time.time() < deadline:
+        started = time.time()
+        client.call("list_projects", {})
+        roundtrip = time.time() - started
+        slowest = max(slowest, roundtrip)
+        status = client.call("get_render",
+                             {"project_id": project_id, "shot_id": shot_id})
+        job = status.get("render_job") or {}
+        progress = job.get("progress") or {}
+        print(f"        {job.get('state', '?')} "
+              f"({progress.get('frames_done', 0)}/"
+              f"{progress.get('frames_total', '?')} frames, "
+              f"poll round-trip {roundtrip:.2f}s)")
+        if job.get("terminal"):
+            job["_slowest_poll_s"] = slowest
+            return status, job
+        time.sleep(poll_s)
+    print("        render job did not finish within the polling window")
+    return None, job
+
+
 def check(label: str, condition: bool, detail: str = "") -> None:
     global PASSED, FAILED
     if condition:
@@ -301,12 +334,28 @@ def main() -> int:
                           "correction", png != second_png,
                           "corrected render is byte-identical to the first")
             # -- finalize: real final render, encode, ffprobe, cleanup -----
-            finalized = client.call("finalize_shot", {
+            submitted = client.call("finalize_shot", {
                 "project_id": project_id, "shot_id": shot_id,
                 "width": args.width, "height": args.height, "engine": args.engine,
             })
-            check(f"{shot_id} finalize succeeded", not finalized.get("_is_error"),
-                  str(finalized)[:300])
+            check(f"{shot_id} finalize accepted the job",
+                  not submitted.get("_is_error"), str(submitted)[:300])
+            check(f"{shot_id} finalize returned a background render job",
+                  bool(submitted.get("job_id"))
+                  and submitted.get("state") in ("QUEUED", "RENDERING"),
+                  str(submitted)[:200])
+
+            status, job = wait_for_render_job(client, project_id, shot_id)
+            check(f"{shot_id} render job finished", bool(job.get("terminal")),
+                  str(job)[:200])
+            check(f"{shot_id} render job COMPLETED",
+                  job.get("state") == "COMPLETED",
+                  str(job.get("error") or job.get("state"))[:200])
+            check(f"{shot_id} MCP stayed responsive while Blender rendered",
+                  float(job.get("_slowest_poll_s") or 0.0) < 10.0,
+                  f"slowest poll {job.get('_slowest_poll_s')}s")
+            finalized = (status or {}).get("result") or job.get("result") or {}
+
             check(f"{shot_id} satisfied the finalization contract",
                   finalized.get("final") is True,
                   str(finalized.get("failed") or finalized.get("reason"))[:200])

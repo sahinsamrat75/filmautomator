@@ -50,6 +50,14 @@ class CameraSpec:
     #: Shallow depth of field when set.
     dof_distance: float | None = None
     fstop: float = 2.8
+    #: Whether the corresponding field was explicitly requested by the
+    #: director, rather than left to the framing solver. Presence — not
+    #: value — decides this: a shot that asks for camera position
+    #: [0, -6, 1.6] (which happens to equal the default) must still get
+    #: exactly that position, never a shot-size solve that moves it 40 m.
+    location_explicit: bool = False
+    look_at_explicit: bool = False
+    lens_explicit: bool = False
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -170,15 +178,34 @@ class ShotSpec:
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "ShotSpec":
+        camera_data = data.get("camera") or {}
+        camera = CameraSpec(**{k: _coerce_tuple(v) for k, v in
+                               camera_data.items()
+                               if k in CameraSpec.__dataclass_fields__})
+        # Explicitness is carried in the flags when the spec has been through
+        # a store/round-trip. For a freshly assembled spec (from a tool call)
+        # the *presence* of the key decides: a director who passed
+        # "location": [...] asked for that position even when it equals the
+        # dataclass default.
+        if "location_explicit" in camera_data:
+            camera.location_explicit = bool(camera_data["location_explicit"])
+        else:
+            camera.location_explicit = camera_data.get("location") is not None
+        if "look_at_explicit" in camera_data:
+            camera.look_at_explicit = bool(camera_data["look_at_explicit"])
+        else:
+            camera.look_at_explicit = camera_data.get("look_at") is not None
+        if "lens_explicit" in camera_data:
+            camera.lens_explicit = bool(camera_data["lens_explicit"])
+        else:
+            camera.lens_explicit = camera_data.get("lens_mm") is not None
         return cls(
             shot_id=data["shot_id"],
             scene_id=data.get("scene_id", ""),
             ordinal=int(data.get("ordinal", 0)),
             duration_s=float(data.get("duration_s", 4.0)),
             description=data.get("description", ""),
-            camera=CameraSpec(**{k: _coerce_tuple(v) for k, v in
-                                 (data.get("camera") or {}).items()
-                                 if k in CameraSpec.__dataclass_fields__}),
+            camera=camera,
             lighting=LightingSpec(**{k: _coerce_tuple(v) for k, v in
                                      (data.get("lighting") or {}).items()
                                      if k in LightingSpec.__dataclass_fields__}),

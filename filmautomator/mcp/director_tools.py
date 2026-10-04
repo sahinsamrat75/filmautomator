@@ -29,6 +29,7 @@ from ..core.storage import StorageGovernor, StorageRefused, StorageState
 from ..core.task import QAStatus, Task
 from ..gateway import ModelGateway
 from ..post.ffmpeg import FFmpegError, VideoEncoder
+from ..render_jobs import frames_progress, render_jobs
 from .preview import build_preview_metadata, deliver_preview
 from .protocol import json_text, tool_result
 from .tools import (
@@ -128,7 +129,13 @@ def tool_render_shot_preview(ctx: ToolContext, args: dict) -> dict:
                 project_id=project_id)
 
     build = blender.build_shot(task, spec, version)
-    preview = blender.render_preview(task, spec, version)
+    # Render the middle of the shot rather than its first frame. A shot whose
+    # subject walks in, or whose camera dollies, looks materially different at
+    # frame 1 than it does in play -- and a preview showing an empty courtyard
+    # while the shot contains a character is worse than no preview, because the
+    # director would judge and approve a frame the audience never sees that way.
+    preview_frame = max(1, spec.frame_count_at(ctx.config.render.fps) // 2)
+    preview = blender.render_preview(task, spec, version, frame=preview_frame)
 
     mirrored = workspace.mirror_preview(spec.shot_id, version)
     preview_path = str(mirrored or preview.image_path)
@@ -228,6 +235,21 @@ def tool_correct_shot(ctx: ToolContext, args: dict) -> dict:
     spec = _shot_spec(ctx.db, project_id, shot_id)
     applied: list[str] = []
 
+    def _num(key: str) -> float | None:
+        """Present-and-not-null numeric value, else None.
+
+        Presence decides whether the field was requested — never truthiness.
+        ``0``, ``0.0`` and ``False`` are legitimate explicit values: passing
+        exposure_compensation=0 must SET it to zero, not leave it untouched.
+        """
+        if key not in args or args[key] is None:
+            return None
+        if isinstance(args[key], bool):
+            # Explicit true/false on a numeric field is an intentional zero or
+            # one, not an accident — coerce rather than silently dropping it.
+            return float(args[key])
+        return optional_float(args, key, None)
+
     if value := require_str(args, "shot_size"):
         spec.camera.shot_size = value
         applied.append(f"camera.shot_size = {value}")
@@ -237,39 +259,48 @@ def tool_correct_shot(ctx: ToolContext, args: dict) -> dict:
     if value := require_str(args, "movement"):
         spec.camera.movement = value
         applied.append(f"camera.movement = {value}")
-    if (value := optional_float(args, "lens_mm", 0.0)):
+    value = _num("lens_mm")
+    if value is not None:
         spec.camera.lens_mm = value
+        spec.camera.lens_explicit = True
         applied.append(f"camera.lens_mm = {value}")
 
     # Camera height and distance are the two corrections an AI reaches for most
     # often after looking at a frame: "too close" and "headroom is wrong". They
     # are expressed the way a cinematographer thinks, then converted to the
     # world-space position the renderer needs.
-    height = optional_float(args, "camera_height_m", 0.0)
-    distance = optional_float(args, "camera_distance_m", 0.0)
-    if height or distance:
+    height = _num("camera_height_m")
+    distance = _num("camera_distance_m")
+    if height is not None or distance is not None:
         current = list(spec.camera.location)
-        if distance:
+        if distance is not None:
             current[1] = -abs(distance)
-        if height:
+        if height is not None:
             current[2] = height
         spec.camera.location = (current[0], current[1], current[2])
+        spec.camera.location_explicit = True
         applied.append(
             f"camera.location = {tuple(round(c, 3) for c in spec.camera.location)}"
-            + (f" (height {height} m)" if height else "")
-            + (f" (distance {distance} m)" if distance else "")
+            + (f" (height {height} m)" if height is not None else "")
+            + (f" (distance {distance} m)" if distance is not None else "")
         )
 
-    if location := args.get("camera_location"):
+    location = args.get("camera_location")
+    if location is not None:
         values = [float(v) for v in location][:3]
-        if len(values) == 3:
-            spec.camera.location = tuple(values)
-            applied.append(f"camera.location = {tuple(values)}")
-    if look_at := args.get("look_at"):
+        if len(values) != 3:
+            return fail("camera_location must be [x, y, z]")
+        spec.camera.location = tuple(values)
+        spec.camera.location_explicit = True
+        applied.append(f"camera.location = {tuple(values)}")
+    look_at = args.get("look_at")
+    if look_at is not None:
         values = [float(v) for v in look_at][:3]
-        if len(values) == 3:
-            spec.camera.look_at = tuple(values)
-            applied.append(f"camera.look_at = {tuple(values)}")
+        if len(values) != 3:
+            return fail("look_at must be [x, y, z]")
+        spec.camera.look_at = tuple(values)
+        spec.camera.look_at_explicit = True
+        applied.append(f"camera.look_at = {tuple(values)}")
 
     for field_name, attribute in (("key_energy", "key_energy"),
                                   ("fill_energy", "fill_energy"),
@@ -277,12 +308,15 @@ def tool_correct_shot(ctx: ToolContext, args: dict) -> dict:
                                   ("world_strength", "world_strength"),
                                   ("exposure_compensation",
                                    "exposure_compensation")):
-        value = optional_float(args, field_name, 0.0)
-        if value:
+        value = _num(field_name)
+        if value is not None:
             setattr(spec.lighting, attribute, value)
             applied.append(f"lighting.{attribute} = {value}")
 
-    if (value := optional_float(args, "duration_s", 0.0)):
+    value = _num("duration_s")
+    if value is not None:
+        if value <= 0:
+            return fail(f"duration_s must be positive, got {value}")
         spec.duration_s = value
         applied.append(f"duration_s = {value}")
     if value := require_str(args, "description"):
@@ -318,8 +352,10 @@ def tool_correct_shot(ctx: ToolContext, args: dict) -> dict:
 @tool("finalize_shot",
       "Render a shot at final quality, encode it, verify it against the "
       "finalization contract, mark it FINAL, and release its frames for "
-      "cleanup. Frames are only released once the MP4 has been verified, so a "
-      "failed render or a failed encode keeps them.",
+      "cleanup. Returns immediately with a job_id: the render runs in the "
+      "background so the MCP server stays responsive — poll get_render until "
+      "state is COMPLETED or FAILED. Frames are only released once the MP4 "
+      "has been verified, so a failed render or a failed encode keeps them.",
       properties={"project_id": {"type": "string"},
                   "shot_id": {"type": "string"},
                   "width": {"type": "integer"},
@@ -354,70 +390,88 @@ def tool_finalize_shot(ctx: ToolContext, args: dict) -> dict:
             detail=refusal.usage.to_dict(),
         )
 
-    context = _agent_context(ctx, project_id)
-    blender = BlenderAgent(context, ctx.session(), ctx.config.render)
-    task = Task(objective=f"final {shot_id}", agent="blender_agent",
-                project_id=project_id)
+    release_frames = require_bool(args, "release_frames", True)
+    frames_dir = workspace.shot_render_dir(shot_id, 1)
+    frames_total = spec.frame_count_at(ctx.config.render.fps)
 
-    blender.build_shot(task, spec, 1)
-    frames = blender.render_final_sequence(task, spec, 1)
+    def body() -> dict[str, Any]:
+        context = _agent_context(ctx, project_id)
+        blender = BlenderAgent(context, ctx.session(), ctx.config.render)
+        task = Task(objective=f"final {shot_id}", agent="blender_agent",
+                    project_id=project_id)
 
-    encoder = VideoEncoder()
-    video = workspace.shot_video(shot_id, 1)
-    try:
-        encoder.encode_frames(frames, video, fps=ctx.config.render.fps)
-    except FFmpegError as exc:
-        # The encode failed, so the frames are still the only copy. Say so
-        # explicitly rather than leaving the caller to infer it.
-        return fail(
-            f"the render finished but encoding failed: {exc}",
-            detail={"frames_kept": str(frames), "shot_id": shot_id,
-                    "frames_released": False,
-                    "note": "frames were kept because no verified MP4 replaced them"},
+        blender.build_shot(task, spec, 1)
+        frames = blender.render_final_sequence(task, spec, 1)
+
+        encoder = VideoEncoder()
+        video = workspace.shot_video(shot_id, 1)
+        try:
+            encoder.encode_frames(frames, video, fps=ctx.config.render.fps)
+        except FFmpegError as exc:
+            # The encode failed, so the frames are still the only copy. Say so
+            # explicitly rather than leaving the caller to infer it.
+            raise RuntimeError(
+                f"the render finished but encoding failed: {exc} — frames "
+                f"kept at {frames} because no verified MP4 replaced them"
+            ) from exc
+
+        ctx.db.register_artifact(
+            project_id, "shot_video", str(video), f"{shot_id} final",
+            shot_id=shot_id, scene_id=spec.scene_id,
+            metadata={"version": 1, "fps": ctx.config.render.fps,
+                      "frames_dir": str(frames)},
         )
 
-    ctx.db.register_artifact(
-        project_id, "shot_video", str(video), f"{shot_id} final",
-        shot_id=shot_id, scene_id=spec.scene_id,
-        metadata={"version": 1, "fps": ctx.config.render.fps,
-                  "frames_dir": str(frames)},
-    )
+        verdict = finalize_shot(
+            ctx.db, project_id, shot_id, video,
+            expected_duration_s=spec.duration_s, encoder=encoder,
+            events=ctx.events,
+        )
 
-    verdict = finalize_shot(
-        ctx.db, project_id, shot_id, video,
-        expected_duration_s=spec.duration_s, encoder=encoder,
-        events=ctx.events,
-    )
-
-    payload: dict[str, Any] = {
-        "shot_id": shot_id,
-        "video": str(video),
-        "frames_dir": str(frames),
-        **verdict.to_dict(),
-    }
-
-    # Frames are released only from a passing verdict. This is the promotion
-    # point the whole storage policy depends on. The governor keeps mirrored
-    # previews (the dashboard's visual record) and releases working copies with
-    # the frames, so a full sweep is safe here.
-    if verdict.frames_releasable and require_bool(args, "release_frames", True):
-        cleanup = governor.cleanup(project_id=project_id)
-        payload["storage"] = {
-            "freed_bytes": cleanup["freed_bytes"],
-            "freed_gb": cleanup["freed_gb"],
-            "removed_count": cleanup["removed_count"],
-            "state_after": cleanup["state_after"],
+        payload: dict[str, Any] = {
+            "shot_id": shot_id,
+            "video": str(video),
+            "frames_dir": str(frames),
+            **verdict.to_dict(),
         }
-        payload["frames_released"] = True
-    else:
-        payload["frames_released"] = False
-        if not verdict.frames_releasable:
-            payload["frames_note"] = (
-                "frames were kept: the shot did not satisfy the finalization "
-                "contract, so the MP4 is not yet a verified replacement"
-            )
 
-    return ok(payload)
+        # Frames are released only from a passing verdict. This is the
+        # promotion point the whole storage policy depends on. The governor
+        # keeps mirrored previews (the dashboard's visual record) and
+        # releases working copies with the frames, so a full sweep is safe.
+        if verdict.frames_releasable and release_frames:
+            cleanup = governor.cleanup(project_id=project_id)
+            payload["storage"] = {
+                "freed_bytes": cleanup["freed_bytes"],
+                "freed_gb": cleanup["freed_gb"],
+                "removed_count": cleanup["removed_count"],
+                "state_after": cleanup["state_after"],
+            }
+            payload["frames_released"] = True
+        else:
+            payload["frames_released"] = False
+            if not verdict.frames_releasable:
+                payload["frames_note"] = (
+                    "frames were kept: the shot did not satisfy the "
+                    "finalization contract, so the MP4 is not yet a verified "
+                    "replacement"
+                )
+
+        return payload
+
+    job = render_jobs().submit(
+        "finalize", body, project_id=project_id, shot_id=shot_id,
+        label=f"finalize {shot_id}",
+        progress=frames_progress(str(frames_dir), frames_total),
+    )
+    return ok({
+        "shot_id": shot_id,
+        "job_id": job.job_id,
+        "state": job.state.value,
+        "note": ("finalization runs in the background; poll get_render with "
+                 "this shot_id (or job_id) until state is COMPLETED or "
+                 "FAILED — the MCP server stays responsive meanwhile"),
+    })
 
 
 @tool("invalidate_shot",
@@ -473,24 +527,17 @@ def _governor(ctx: ToolContext) -> StorageGovernor:
                                                 "share of the workspace."}})
 def tool_get_storage_status(ctx: ToolContext, args: dict) -> dict:
     governor = _governor(ctx)
-    usage = governor.measure()
-    payload = usage.to_dict()
-    payload["cleanup_enabled"] = ctx.config.storage.cleanup_enabled
-
     project_id = require_str(args, "project_id")
     if project_id:
         ctx.project_and_workspace(project_id)
-        project_root = ctx.config.workspace / project_id
-        project_bytes = 0
-        for path in project_root.rglob("*") if project_root.is_dir() else []:
-            if path.is_file() and not path.is_symlink():
-                try:
-                    project_bytes += path.stat().st_size
-                except OSError:
-                    continue
-        payload["project_id"] = project_id
-        payload["project_bytes"] = project_bytes
-        payload["project_gb"] = round(project_bytes / 1024 ** 3, 3)
+        # Scoped measure: the workspace-wide totals against the shared
+        # ceiling, plus a project section containing only this project's
+        # bytes and held-back entries.
+        usage = governor.measure(project_id=project_id)
+    else:
+        usage = governor.measure()
+    payload = usage.to_dict()
+    payload["cleanup_enabled"] = ctx.config.storage.cleanup_enabled
     return ok(payload)
 
 

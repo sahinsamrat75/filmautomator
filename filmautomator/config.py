@@ -115,6 +115,13 @@ class BlenderConfig:
     startup_timeout_s: float = 120.0
     #: Seconds to wait for a single operation to return.
     op_timeout_s: float = 900.0
+    #: Seconds a render-class op may run. Renders legitimately take a long
+    #: time; this is a genuine ceiling (crash/stall detection), not a
+    #: substitute for the render job lifecycle.
+    render_timeout_s: float = 7200.0
+    #: Seconds a non-render call waits for the control channel before it
+    #: fails fast with BlenderBusy instead of queueing behind a render.
+    busy_wait_s: float = 5.0
 
 
 @dataclass(slots=True)

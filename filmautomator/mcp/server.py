@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, TextIO
 
 from .. import __version__
+from ..blender.session import BlenderBusy
 from ..config import AppConfig, load_config
 from . import continuity_tools  # noqa: F401 - registers continuity + audio tools
 from . import director_tools  # noqa: F401 - registers the director-loop tools
@@ -213,6 +214,17 @@ class MCPServer:
             return found.handler(self.context, arguments)
         except MCPError as exc:
             return tool_result([json_text({"error": exc.message})], is_error=True)
+        except BlenderBusy as exc:
+            # Blender is mid-render. Report the lifecycle state with the
+            # refusal so the caller knows exactly what to poll instead of
+            # staring at a timeout.
+            from ..render_jobs import render_jobs
+
+            active = render_jobs().active()
+            detail: dict[str, Any] = {"error": str(exc), "blender": "BUSY"}
+            if active is not None:
+                detail["render_job"] = active.to_dict()
+            return tool_result([json_text(detail)], is_error=True)
         except Exception as exc:  # noqa: BLE001 - report, never drop the connection
             log.error("tool %s raised", name, exc_info=True)
             return tool_result(

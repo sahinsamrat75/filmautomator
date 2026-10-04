@@ -430,7 +430,79 @@ class BlenderAgent(Agent):
         self._last_characters = {}
         for index, subject in enumerate(spec.subjects):
             built = self._build_subject_canonical(subject, index, notes)
+            self._animate_subject(built, subject, spec, notes)
             self._last_characters[subject.name] = built.to_dict()
+
+    #: How a subject's action becomes motion across its shot: the offset the
+    #: character starts from, in metres, and the poses it passes through in
+    #: order. A shot declares where the character ends up; the action decides
+    #: where they came from and what they do on the way.
+    #:
+    #: The start pose is always `rest` (an explicit zero) rather than `idle`
+    #: (an empty mapping) — a bone needs two keys to move, and a pose that
+    #: names no bones writes no key at all.
+    _SUBJECT_MOTION: dict[str, tuple[tuple[float, float, float],
+                                     tuple[str, ...]]] = {
+        "enter": ((-3.5, 0.0, 0.0),
+                  ("walk", "walk_b", "walk", "walk_b", "enter")),
+        "walk": ((-3.0, 0.0, 0.0),
+                 ("walk", "walk_b", "walk", "walk_b", "walk")),
+        "reach": ((0.0, 0.0, 0.0), ("rest", "reach")),
+        "lean": ((0.0, 0.0, 0.0), ("rest", "lean")),
+        "turn": ((0.0, 0.0, 0.0), ("rest", "turn")),
+        "react": ((0.0, 0.0, 0.0), ("rest", "react", "react")),
+    }
+
+    def _animate_subject(self, built: Any, subject: SubjectSpec,
+                         spec: ShotSpec, notes: list[str]) -> None:
+        """Give a subject real motion across its shot.
+
+        Everything here becomes keyframes on real Blender objects, so the
+        rendered frames genuinely differ from one another. A subject whose
+        action implies no motion is left in a single held pose.
+        """
+        pose = self._pose_for_action(subject.action)
+        plan = self._SUBJECT_MOTION.get(pose)
+
+        if plan is None:
+            try:
+                pose_character(self.session, built.armature, pose, frame=None)
+                notes.append(f"{subject.name!r} posed: {pose} (held, no motion)")
+            except Exception as exc:  # noqa: BLE001 - a pose must not fail a build
+                notes.append(f"{subject.name!r} pose {pose!r} skipped: {exc}")
+            return
+
+        travel, poses = plan
+        frames = spec.frame_count_at(self.render.fps)
+        lx, ly, lz = (float(v) for v in subject.location)
+
+        # Travel: the character starts offset and arrives on its mark. Two
+        # keys are enough because Blender interpolates between them.
+        if travel != (0.0, 0.0, 0.0):
+            for frame, remaining in ((1, 1.0), (frames, 0.0)):
+                self.session.call(
+                    "set_keyframe", name=built.root, frame=frame,
+                    location=[lx + travel[0] * remaining,
+                              ly + travel[1] * remaining,
+                              lz + travel[2] * remaining],
+                )
+
+        # Poses: spread evenly across the shot, inclusive of both ends.
+        last = max(1, len(poses) - 1)
+        keyed: list[str] = []
+        for index, name in enumerate(poses):
+            frame = 1 + round(index * (frames - 1) / last)
+            try:
+                pose_character(self.session, built.armature, name, frame=frame)
+                keyed.append(f"{name}@{frame}")
+            except Exception as exc:  # noqa: BLE001
+                notes.append(f"{subject.name!r} pose {name!r} skipped: {exc}")
+
+        moved = "yes" if travel != (0.0, 0.0, 0.0) else "no"
+        notes.append(
+            f"{subject.name!r} animated over {frames} frames "
+            f"(travel={moved}, poses: {', '.join(keyed)})"
+        )
 
     def _character_record(self, name: str) -> dict[str, Any] | None:
         """Load the canonical character record, if one was defined."""
@@ -486,13 +558,9 @@ class BlenderAgent(Agent):
             f"(record={'defined' if record else 'proxy fallback'})"
         )
 
-        # The shot's action selects a deterministic pose.
-        pose = self._pose_for_action(subject.action)
-        try:
-            pose_character(self.session, built.armature, pose, frame=None)
-            notes.append(f"{subject.name!r} posed: {pose}")
-        except Exception as exc:  # noqa: BLE001 - a pose must not fail a build
-            notes.append(f"{subject.name!r} pose {pose!r} skipped: {exc}")
+        # Posing is the animation pass's job: a held pose and a keyframed
+        # performance must not both write to the same bones, or the held pose
+        # would bake the end state in from frame one.
         return built
 
     @staticmethod
@@ -508,7 +576,9 @@ class BlenderAgent(Agent):
             return "reach"
         if any(word in text for word in ("lean", "rest", "slump")):
             return "lean"
-        if any(word in text for word in ("react", "startle", "turn", "look",
+        if any(word in text for word in ("turn", "look", "glance")):
+            return "turn"
+        if any(word in text for word in ("react", "startle",
                                          "surprise", "fear", "gasp")):
             return "react"
         return "idle"
@@ -706,11 +776,13 @@ class BlenderAgent(Agent):
         subject = spec.subjects[0] if spec.subjects else None
 
         # An explicitly placed camera is a directorial decision, not a default
-        # to be solved away. The dataclass default is (0, -6, 1.6); anything
-        # else was asked for on purpose.
-        explicit_location = tuple(camera.location) != (0.0, -6.0, 1.6)
-        explicit_look = tuple(camera.look_at) != (0.0, 0.0, 1.0)
-        explicit_lens = bool(camera.lens_mm)
+        # to be solved away. The flags record whether the director actually
+        # asked for these fields — value comparison against the dataclass
+        # default wrongly treated an intentional (0, -6, 1.6) as "untouched"
+        # and re-solved it 40 m away.
+        explicit_location = camera.location_explicit
+        explicit_look = camera.look_at_explicit
+        explicit_lens = camera.lens_explicit
 
         if subject is not None:
             look_height = _LOOK_AT_HEIGHT.get(camera.shot_size, 0.58)
@@ -742,8 +814,36 @@ class BlenderAgent(Agent):
                 dy = -distance
             location = (look_at[0] + dx, look_at[1] + dy, look_at[2] + dz)
 
-        lens = float(camera.lens_mm or _DEFAULT_LENS.get(camera.shot_size, 50.0))
+        # Lens precedence: shot-specific value > shot-size preset > global.
+        # lens_mm=0 means "auto", which falls through to the preset.
+        if explicit_lens and camera.lens_mm:
+            lens = float(camera.lens_mm)
+        else:
+            lens = float(_DEFAULT_LENS.get(camera.shot_size,
+                                           camera.lens_mm or 50.0))
         return location, look_at, lens
+
+    def _require_camera_verified(self, spec: ShotSpec, action: str) -> None:
+        """Refuse to render when the camera in Blender is not what was asked.
+
+        The verification compares the intended position/lens against what
+        Blender actually reports. A mismatch means Blender silently kept its
+        own values; rendering anyway would produce frames of the wrong
+        framing and hand them to the AI as if they were the request.
+        """
+        verification = self._camera_verification
+        if not verification:
+            raise RuntimeError(
+                f"camera for {spec.shot_id} was never verified against "
+                f"Blender; refusing to {action} an unverified camera"
+            )
+        if not verification.get("ok"):
+            problems = "; ".join(verification.get("problems") or ["unknown"])
+            raise RuntimeError(
+                f"camera verification failed for {spec.shot_id}: {problems}. "
+                f"Refusing to {action} — fix the camera, do not render what "
+                f"was not asked for."
+            )
 
     # -- rendering ---------------------------------------------------------
 
@@ -758,6 +858,10 @@ class BlenderAgent(Agent):
         ws = self.ctx.workspace
         path = ws.shot_preview(spec.shot_id, version)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # The preview is what the AI director will look at; it must show the
+        # camera that was actually asked for.
+        self._require_camera_verified(spec, "render a preview")
 
         self.emit(EventKind.PREVIEW_STARTED,
                   f"Rendering preview for {spec.shot_id} (v{version:03d})",
@@ -841,6 +945,10 @@ class BlenderAgent(Agent):
     def render_final_sequence(self, task: Task, spec: ShotSpec, version: int,
                               *, fps: int | None = None) -> Path:
         """Full-quality frame sequence — the input to the FFmpeg encode."""
+        # Verified before a single frame is spent: a render with the wrong
+        # camera is minutes of wasted work handed to the AI as fact.
+        self._require_camera_verified(spec, "render the final sequence")
+
         ws = self.ctx.workspace
         fps = fps or self.render.fps
         out_dir = ws.shot_render_dir(spec.shot_id, version)

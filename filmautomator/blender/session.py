@@ -31,6 +31,10 @@ log = logging.getLogger(__name__)
 
 CONTROL_SERVER = Path(__file__).parent / "scripts" / "control_server.py"
 
+#: Operations that occupy Blender's main loop from request to completion.
+#: While one of these runs, every other call fails fast instead of blocking.
+RENDER_OPS = frozenset({"render_animation", "render_still"})
+
 
 class BlenderError(RuntimeError):
     """A control operation returned ``ok: false``."""
@@ -44,6 +48,15 @@ class BlenderError(RuntimeError):
 
 class BlenderUnavailable(RuntimeError):
     """Blender is not installed, or exited before it could serve requests."""
+
+
+class BlenderBusy(RuntimeError):
+    """Blender is occupied by a render (or another call) and must not be queued behind.
+
+    Failing fast is the point: waiting would block the MCP control plane for
+    as long as the render runs. The caller is expected to report the render
+    lifecycle state instead of hanging.
+    """
 
 
 class BlenderSession:
@@ -67,6 +80,14 @@ class BlenderSession:
         self._restarts = 0
         #: Set when the session died unexpectedly, so callers can report why.
         self.last_failure: str = ""
+        #: Serialises actual socket IO. Held for the duration of a render op,
+        #: never acquired by other threads while a render owns it.
+        self._io_lock = threading.RLock()
+        #: Held by exactly one render-class op at a time (non-blocking).
+        self._render_lock = threading.Lock()
+        self._render_active = False
+        self._render_owner: int | None = None
+        self._render_label = ""
 
     # -- lifecycle ---------------------------------------------------------
 
@@ -259,34 +280,117 @@ class BlenderSession:
             )
         return response
 
-    def call(self, op: str, **args: Any) -> Any:
-        """Run one operation, restarting Blender once if it has died.
+    def call(self, op: str, *, timeout: float | None = None,
+             **args: Any) -> Any:
+        """Run one operation, restarting Blender only if it has actually died.
+
+        Two hard rules this method now enforces:
+
+        * **Never restart Blender while it is alive and busy.** A timeout is
+          not a crash. The old behaviour — restart on timeout, then re-send
+          the op — re-ran renders against an empty scene and destroyed the
+          frames it was interrupting. Timeouts now raise :class:`BlenderBusy`
+          with the scene and partial output preserved.
+        * **Never queue behind a render.** A render-class op owns Blender's
+          main loop; anything else arriving mid-render fails fast with
+          :class:`BlenderBusy` instead of blocking the MCP control plane.
 
         Returns the operation's ``result`` payload. Raises :class:`BlenderError`
-        when the operation itself failed (which is a scene problem, not a
-        process problem) and :class:`BlenderUnavailable` when Blender could not
-        be reached even after a restart.
+        when the operation itself failed (a scene problem, not a process
+        problem), :class:`BlenderBusy` when Blender is occupied, and
+        :class:`BlenderUnavailable` when Blender is gone even after recovery.
         """
+        is_render = op in RENDER_OPS
+        owner = threading.get_ident()
+
+        if (not is_render and self._render_active
+                and self._render_owner != owner):
+            label = self._render_label or "render in progress"
+            raise BlenderBusy(
+                f"Blender is rendering ({label}); {op!r} would block behind "
+                "it. Read the render lifecycle state and retry when it is "
+                "not RENDERING."
+            )
+
+        if is_render:
+            if not self._render_lock.acquire(blocking=False):
+                raise BlenderBusy(
+                    "another render already owns this Blender session; only "
+                    "one render can run at a time"
+                )
+            self._render_active = True
+            self._render_owner = owner
+            self._render_label = op
+
+        try:
+            if not is_render:
+                # Normal ops queue behind each other for a moment at most; a
+                # render holding the channel is not something to wait for.
+                if not self._io_lock.acquire(timeout=self.config.busy_wait_s):
+                    raise BlenderBusy(
+                        f"Blender did not free its control channel within "
+                        f"{self.config.busy_wait_s:.0f}s for {op!r}"
+                    )
+            else:
+                self._io_lock.acquire()
+            try:
+                return self._call_locked(op, is_render=is_render,
+                                         timeout=timeout, **args)
+            finally:
+                self._io_lock.release()
+        finally:
+            if is_render:
+                self._render_active = False
+                self._render_owner = None
+                self._render_label = ""
+                self._render_lock.release()
+
+    def _call_locked(self, op: str, *, is_render: bool,
+                     timeout: float | None, **args: Any) -> Any:
         if not self.running:
             self.last_failure = "session was not running"
             self.restart()
 
-        assert self._sock is not None and self._stream is not None
-        self._sock.settimeout(self.config.op_timeout_s)
+        if self._sock is None or self._stream is None:
+            raise BlenderUnavailable(
+                "Blender control channel is not open; the session did not "
+                "come up"
+            )
+        if timeout is None:
+            timeout = (self.config.render_timeout_s if is_render
+                       else self.config.op_timeout_s)
+        self._sock.settimeout(timeout)
 
         try:
             response = self._send_raw(op, args)
-        except (socket.timeout, BlenderUnavailable, OSError, json.JSONDecodeError) as exc:
-            # One automatic recovery attempt, per spec section 19.
+        except socket.timeout as exc:
+            # Blender is alive but occupied. Restarting here would pull the
+            # scene out from under an in-flight operation (this exact path
+            # once restarted a finished render and re-ran it empty). Raise
+            # instead: the scene and everything written so far survive.
+            self.last_failure = f"timeout: {op} exceeded {timeout:.0f}s"
+            log.warning("control call %r timed out after %.0f s; keeping "
+                        "Blender alive with its scene", op, timeout)
+            raise BlenderBusy(
+                f"{op} did not answer within {timeout:.0f}s. Blender was left "
+                "running with its scene and any output it had written. This "
+                "is a timeout, not a crash — check render state before "
+                "retrying rather than re-running blindly."
+            ) from exc
+        except (BlenderUnavailable, OSError, json.JSONDecodeError) as exc:
+            # One automatic recovery attempt when the process or channel is
+            # genuinely gone, per spec section 19.
             self.last_failure = f"{type(exc).__name__}: {exc}"
             log.error("control call %r failed (%s); restarting Blender", op, exc)
             try:
                 self.restart()
+                self._sock.settimeout(timeout)
                 response = self._send_raw(op, args)
             except Exception as retry_exc:  # noqa: BLE001
                 raise BlenderUnavailable(
                     f"Blender unavailable after restart: {retry_exc}. "
-                    f"Original failure: {exc}. Blender output:\n{self.tail_log(30)}"
+                    f"Original failure: {exc}. Blender output:\n"
+                    f"{self.tail_log(30)}"
                 ) from retry_exc
 
         if not response.get("ok"):

@@ -30,6 +30,7 @@ from ..core.workspace import Workspace
 from ..gateway import ModelGateway
 from ..post.ffmpeg import FFmpegError, VideoEncoder
 from ..qa import FinalQA
+from ..render_jobs import frames_progress, render_jobs
 from ..runtime import RunState
 from ..producer import ProductionRequest
 from .preview import build_preview_metadata, deliver_preview
@@ -658,6 +659,7 @@ def tool_list_shots(ctx: ToolContext, args: dict) -> dict:
         out.append({
             "shot_id": shot["shot_id"],
             "scene_id": shot["scene_id"],
+            "ordinal": shot.get("ordinal", 0),
             "status": shot["status"],
             "duration_s": shot["duration_s"],
             "description": spec.get("description", ""),
@@ -733,22 +735,35 @@ def tool_create_shot(ctx: ToolContext, args: dict) -> dict:
     project_id = require_str(args, "project_id")
     shot_id = require_str(args, "shot_id")
     require_project(ctx.db, project_id)
+    scene_id = require_str(args, "scene_id") or "SC01"
+
+    # Ordinal: deterministic, unique within the scene. An existing shot keeps
+    # its ordinal (re-creating must not renumber the film); a new shot takes
+    # the next free position. Assembly order depends on this being stable.
+    existing_row = ctx.db.get_shot(project_id, shot_id)
+    if existing_row is not None:
+        ordinal = int(existing_row.get("ordinal") or 0)
+    else:
+        siblings = ctx.db.list_shots(project_id, scene_id)
+        ordinal = len(siblings)
 
     spec = {
         "shot_id": shot_id,
-        "scene_id": require_str(args, "scene_id") or "SC01",
+        "scene_id": scene_id,
+        "ordinal": ordinal,
         "description": require_str(args, "description"),
         "duration_s": optional_float(args, "duration_s", 4.0) or 4.0,
         "camera": {
             "shot_size": require_str(args, "shot_size") or "medium",
             "angle": require_str(args, "angle") or "eye_level",
-            "lens_mm": optional_float(args, "lens_mm", 0.0) or 0.0,
         },
         "lighting": {"mood": require_str(args, "lighting_mood") or "natural"},
         "environment": require_str(args, "environment"),
         "subjects": [],
         "quality_criteria": [],
     }
+    if args.get("lens_mm") is not None:
+        spec["camera"]["lens_mm"] = optional_float(args, "lens_mm", 0.0) or 0.0
     if movement := require_str(args, "movement"):
         spec["camera"]["movement"] = movement
     if camera_location := args.get("camera_location"):
@@ -798,47 +813,138 @@ def tool_render_shot_final(ctx: ToolContext, args: dict) -> dict:
     if engine := require_str(args, "engine"):
         ctx.config.render.final_engine = engine
 
-    context = _agent_context(ctx, project_id)
-    blender = BlenderAgent(context, ctx.session(), ctx.config.render)
-    task = Task(objective=f"final {shot_id}", agent="blender_agent",
-                project_id=project_id)
-    blender.build_shot(task, spec, 1)
-    frames = blender.render_final_sequence(task, spec, 1)
+    frames_dir = workspace.shot_render_dir(shot_id, 1)
+    frames_total = spec.frame_count_at(ctx.config.render.fps)
 
-    encoder = VideoEncoder()
-    video = workspace.shot_video(shot_id, 1)
-    try:
-        encoder.encode_frames(frames, video, fps=ctx.config.render.fps)
-    except FFmpegError as exc:
-        return fail(f"render succeeded but encoding failed: {exc}",
-                    detail={"frames": str(frames)})
+    def body() -> dict[str, Any]:
+        context = _agent_context(ctx, project_id)
+        blender = BlenderAgent(context, ctx.session(), ctx.config.render)
+        task = Task(objective=f"final {shot_id}", agent="blender_agent",
+                    project_id=project_id)
+        blender.build_shot(task, spec, 1)
+        frames = blender.render_final_sequence(task, spec, 1)
 
-    ctx.db.register_artifact(project_id, "shot_video", str(video),
-                             f"{shot_id} final", shot_id=shot_id)
-    ctx.emit(project_id, EventKind.RENDER_COMPLETED,
-             f"{shot_id} rendered and encoded", agent="blender_agent",
-             shot_id=shot_id, payload={"video": str(video)})
-    return ok({"shot_id": shot_id, "frames": str(frames), "video": str(video),
-               "frames_dir": str(frames)})
+        encoder = VideoEncoder()
+        video = workspace.shot_video(shot_id, 1)
+        try:
+            encoder.encode_frames(frames, video, fps=ctx.config.render.fps)
+        except FFmpegError as exc:
+            # The encode failed, so the frames are still the only copy. Say so
+            # explicitly rather than leaving the caller to infer it.
+            raise RuntimeError(
+                f"render succeeded but encoding failed: {exc} "
+                f"(frames kept at {frames})"
+            ) from exc
+
+        ctx.db.register_artifact(project_id, "shot_video", str(video),
+                                 f"{shot_id} final", shot_id=shot_id)
+        ctx.emit(project_id, EventKind.RENDER_COMPLETED,
+                 f"{shot_id} rendered and encoded", agent="blender_agent",
+                 shot_id=shot_id, payload={"video": str(video)})
+        return {"shot_id": shot_id, "frames": str(frames), "video": str(video),
+                "frames_dir": str(frames)}
+
+    job = render_jobs().submit(
+        "final_render", body, project_id=project_id, shot_id=shot_id,
+        label=f"final render {shot_id}",
+        progress=frames_progress(str(frames_dir), frames_total),
+    )
+    return ok({
+        "shot_id": shot_id,
+        "job_id": job.job_id,
+        "state": job.state.value,
+        "note": ("the render is running in the background; poll get_render "
+                 "with this shot_id until state is COMPLETED or FAILED. The "
+                 "MCP server stays responsive while it renders."),
+    })
 
 
-@tool("approve_shot", "Approve a shot, marking a version as the good one.",
+@tool("approve_shot",
+      "Approve a shot, recording which preview version you are approving as "
+      "the visual basis. Works from previews: a final render is NOT required "
+      "to approve. Finalization later renders at final quality against that "
+      "approved look.",
       properties={"project_id": {"type": "string"},
                   "shot_id": {"type": "string"},
-                  "version": {"type": "integer"}},
+                  "version": {"type": "integer",
+                              "description": "Preview version to approve. "
+                                             "Defaults to the latest preview."}},
       required=["project_id", "shot_id"])
 def tool_approve_shot(ctx: ToolContext, args: dict) -> dict:
     project_id = require_str(args, "project_id")
     shot_id = require_str(args, "shot_id")
-    versions = ctx.db.list_shot_versions(project_id, shot_id)
-    if not versions:
-        return fail(f"{shot_id} has no rendered versions to approve")
-    version = optional_int(args, "version", versions[-1].version_no)
-    ctx.db.approve_shot_version(project_id, shot_id, version or versions[-1].version_no)
+    require_project(ctx.db, project_id)
+
+    # The candidate set is the shot's PREVIEW versions — what the director
+    # actually looked at. Approval is a statement about a look, so it binds
+    # to a preview whether or not a final render exists yet.
+    preview_versions: list[int] = []
+    for render in ctx.db.list_renders(project_id, shot_id):
+        if render.get("kind") == "preview":
+            version_no = int(render.get("version_no") or 0)
+            if version_no and version_no not in preview_versions:
+                preview_versions.append(version_no)
+    if not preview_versions:
+        # Fall back to the artifact registry for previews recorded there.
+        for artifact in ctx.db.list_artifacts(project_id):
+            if (artifact.get("kind") == "preview"
+                    and artifact.get("shot_id") == shot_id):
+                metadata = artifact.get("metadata") or {}
+                version_no = int(metadata.get("version") or 0) if isinstance(
+                    metadata, dict) else 0
+                if version_no and version_no not in preview_versions:
+                    preview_versions.append(version_no)
+    preview_versions.sort()
+
+    if not preview_versions:
+        return fail(
+            f"{shot_id} has no rendered preview to approve — call "
+            f"render_shot_preview first"
+        )
+
+    requested = optional_int(args, "version")
+    if requested is not None:
+        if requested not in preview_versions:
+            return fail(
+                f"{shot_id} has no preview v{requested:03d}; known preview "
+                f"versions: {preview_versions}"
+            )
+        version = requested
+    else:
+        version = preview_versions[-1]
+
+    # Make sure the version round exists, then mark it approved. The preview
+    # path is recorded as the render basis on that same row, so the approved
+    # look stays traceable to the exact image that was accepted.
+    preview_path = ""
+    for render in ctx.db.list_renders(project_id, shot_id):
+        if (render.get("kind") == "preview"
+                and int(render.get("version_no") or 0) == version):
+            preview_path = str(render.get("path") or "")
+            break
+    known = {v.version_no for v in ctx.db.list_shot_versions(project_id, shot_id)}
+    if version not in known:
+        ctx.db.add_shot_version(project_id, shot_id, version_no=version,
+                                render_path=preview_path,
+                                notes="approved from preview")
+    else:
+        ctx.db.update_shot_version(project_id, shot_id, version,
+                                   render_path=preview_path)
+    ctx.db.approve_shot_version(project_id, shot_id, version)
     ctx.emit(project_id, EventKind.SHOT_APPROVED,
-             f"{shot_id} approved by owner", agent="owner", shot_id=shot_id,
-             payload={"version": version})
-    return ok({"shot_id": shot_id, "approved_version": version})
+             f"{shot_id} approved on preview v{version:03d}", agent="owner",
+             shot_id=shot_id,
+             payload={"version": version, "preview_path": preview_path,
+                      "basis": "preview"})
+    return ok({
+        "shot_id": shot_id,
+        "approved_version": version,
+        "basis": "preview",
+        "preview_path": preview_path,
+        "preview_versions": preview_versions,
+        "note": ("approval recorded against the preview; finalize_shot will "
+                 "render the final quality output for this look"),
+    })
 
 
 @tool("reject_shot", "Reject a shot and record why.",
@@ -1085,12 +1191,38 @@ def tool_get_preview(ctx: ToolContext, args: dict) -> dict:
 
 
 @tool("get_render",
-      "Where a shot's rendered frames live, and how many there are.",
+      "Render lifecycle and output. While a final render or finalize job is "
+      "running this returns its state (QUEUED, RENDERING, COMPLETED, FAILED, "
+      "CANCELLED) plus frame progress straight from the job registry — it "
+      "never waits on Blender. When the job completed, its full result "
+      "(frames, video, verification) is included. With no job it falls back "
+      "to the last rendered frames on disk.",
       properties={"project_id": {"type": "string"},
-                  "shot_id": {"type": "string"}})
+                  "shot_id": {"type": "string"},
+                  "job_id": {"type": "string",
+                             "description": "Pin one specific render job."}})
 def tool_get_render(ctx: ToolContext, args: dict) -> dict:
     project_id = require_str(args, "project_id")
     shot_id = require_str(args, "shot_id")
+
+    # Lifecycle first: job state is read from the registry, never from
+    # Blender, so this stays responsive no matter what Blender is doing.
+    jobs = render_jobs()
+    job_id = require_str(args, "job_id")
+    job = jobs.get(job_id) if job_id else None
+    if job is None and project_id:
+        job = jobs.latest(project_id=project_id, shot_id=shot_id or "")
+    if job is not None:
+        payload = {"render_job": job.to_dict()}
+        if job.terminal and job.state.value == "COMPLETED" and job.result:
+            payload["result"] = job.result
+        if not job.terminal:
+            payload["note"] = (
+                "a render/finalize job is in progress; this response came "
+                "from the job registry and did not wait for Blender"
+            )
+        return ok(payload)
+
     artifact = ctx.db.latest_artifact(project_id, "render", shot_id or None)
     if artifact is None:
         return fail("no final render has been produced yet")
@@ -1098,7 +1230,22 @@ def tool_get_render(ctx: ToolContext, args: dict) -> dict:
 
     frames = find_frame_sequence(artifact["path"])
     return ok({**artifact, "frame_count": len(frames),
-               "first_frame": str(frames[0]) if frames else ""})
+               "first_frame": str(frames[0]) if frames else "",
+               "state": "COMPLETED"})
+
+
+@tool("cancel_render",
+      "Cancel a queued render job before it starts. A job already RENDERING "
+      "inside Blender cannot be interrupted without risking the scene, and "
+      "this says so instead of pretending to stop it.",
+      properties={"job_id": {"type": "string"}},
+      required=["job_id"])
+def tool_cancel_render(ctx: ToolContext, args: dict) -> dict:
+    job_id = require_str(args, "job_id")
+    ok_cancel, message = render_jobs().cancel(job_id)
+    if not ok_cancel:
+        return fail(message)
+    return ok({"job_id": job_id, "state": "CANCELLED", "note": message})
 
 
 @tool("get_final_movie",
@@ -1264,6 +1411,39 @@ def tool_assemble_movie(ctx: ToolContext, args: dict) -> dict:
                        frames_by_shot=frames_by_shot,
                        expected_audio=expected_audio,
                        finalized_shots=set(final_shot_ids))
+
+    # Publish the QA verdict and a production report as artifacts. Nothing else
+    # on this path did: only the full Producer ever registered either one, so a
+    # production assembled shot by shot through MCP failed its own integrity
+    # gate (core.integrity.REQUIRED_KINDS demands both) however well it went.
+    qa_path = workspace.qa_report()
+    qa_path.write_text(json.dumps(qa_report.to_dict(), indent=2),
+                       encoding="utf-8")
+    ctx.db.record_qa(
+        project_id, "production", project_id, "final",
+        QAStatus.PASSED if qa_report.passed else QAStatus.FAILED,
+        score=qa_report.score,
+        findings=[c.to_dict() for c in qa_report.failures],
+    )
+    ctx.db.register_artifact(project_id, "qa_report", str(qa_path), "QA report")
+
+    scored = encoder.probe(final)
+    report_path = workspace.report("production_report.txt")
+    report_path.write_text(json.dumps({
+        "project_id": project_id,
+        "shots": final_shot_ids,
+        "shot_count": len(final_shot_ids),
+        "final_movie": str(final),
+        "size_bytes": Path(final).stat().st_size,
+        "codec": scored.video_codec,
+        "resolution": f"{scored.width}x{scored.height}",
+        "fps": round(scored.fps, 2),
+        "duration_s": round(scored.duration_s, 3),
+        "qa_passed": qa_report.passed,
+        "qa_score": round(qa_report.score, 3),
+    }, indent=2), encoding="utf-8")
+    ctx.db.register_artifact(project_id, "report", str(report_path),
+                             "Production report")
 
     probe = encoder.probe(final)
     payload: dict[str, Any] = {

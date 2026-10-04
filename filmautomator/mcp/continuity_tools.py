@@ -167,6 +167,26 @@ def tool_list_characters(ctx: ToolContext, args: dict) -> dict:
           "layout": {"type": "string"},
           "weather": {"type": "string", "description": "e.g. 'heavy rain'"},
           "props": {"type": "array", "items": {"type": "string"}},
+          "objects": {"type": "array",
+                      "description": "Structured placement plan — the "
+                                     "authoritative spatial source. Each "
+                                     "entry: {id, type, position: [x,y,z], "
+                                     "rotation (z radians), material, "
+                                     "dimensions: {width, depth, height}}. "
+                                     "Types with real geometry: bench, tree, "
+                                     "wall, column, crate, barrel, rock, "
+                                     "bush, fence, sign, planter, fountain, "
+                                     "lantern, archway.",
+                      "items": {"type": "object",
+                                "properties": {
+                                    "id": {"type": "string"},
+                                    "type": {"type": "string"},
+                                    "position": {"type": "array",
+                                                 "items": {"type": "number"}},
+                                    "rotation": {"type": "number"},
+                                    "material": {"type": "string"},
+                                    "dimensions": {"type": "object"},
+                                }}},
           "continuity": {"type": "object",
                          "description": "What must stay identical across shots."},
       },
@@ -187,6 +207,8 @@ def tool_define_environment(ctx: ToolContext, args: dict) -> dict:
         "layout": require_str(args, "layout"),
         "weather": require_str(args, "weather"),
         "props": list(args.get("props") or []),
+        "objects": [o for o in (args.get("objects") or [])
+                    if isinstance(o, dict)],
         "continuity": args.get("continuity") or {},
     }
     spec = {k: v for k, v in spec.items() if v not in ("", [], {}, None)}

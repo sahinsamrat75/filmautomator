@@ -109,6 +109,123 @@ def test_environment_builder_creates_ground_backdrop_and_fountain():
 
 
 # ---------------------------------------------------------------------------
+# C. Semantic prop geometry: the type decides the shape
+# ---------------------------------------------------------------------------
+
+
+def _prop_names(built) -> dict[str, list[str]]:
+    """Map each prop id in the manifest to the objects it built."""
+    return {pid: entry["objects"] for pid, entry in built.props.items()}
+
+
+def test_free_text_props_get_semantic_geometry_not_identical_cubes():
+    """The reported defect: bench/tree/wall all became the same box."""
+    session = _FakeSession()
+    built = build_environment(
+        session, "ENV_TEST_01",
+        {"props": ["bench", "tree", "wall"],
+         "layout": "", "description": "courtyard with bench, tree and wall"},
+    )
+    manifest = _prop_names(built)
+    bench = manifest.get("bench", [])
+    tree = manifest.get("tree", [])
+    wall = manifest.get("wall", [])
+
+    assert bench, f"bench not built: {manifest.keys()}"
+    assert tree, f"tree not built: {manifest.keys()}"
+    assert wall, f"wall not built: {manifest.keys()}"
+
+    # Bench: seat + backrest + legs, no seat-without-backrest box.
+    assert any("_seat" in n for n in bench), bench
+    assert any("_back" in n for n in bench), bench
+    assert any("_leg" in n for n in bench), bench
+    # Tree: trunk + canopy, built from different primitives.
+    assert any("_trunk" in n for n in tree), tree
+    assert any("_canopy" in n for n in tree), tree
+    kinds = {o["kind"] for o in session.objects
+             if o["name"] in set(tree)}
+    assert "cylinder" in kinds and "sphere" in kinds, kinds
+    # Wall: a thin, tall slab with a cap.
+    assert any("_slab" in n for n in wall), wall
+    assert any("_cap" in n for n in wall), wall
+    slab = next(o for o in session.objects if o["name"] == wall[0])
+    sx, sy, sz = slab["scale"]
+    assert sy < sx, f"wall slab is not thin: {slab['scale']}"
+    assert sz > sy, f"wall slab is not tall: {slab['scale']}"
+
+    # Every prop group differs from every other: no shared shape.
+    assert set(bench) != set(tree) != set(wall)
+
+
+def test_the_structured_object_plan_drives_placement():
+    """The plan is authoritative; free text is only context."""
+    session = _FakeSession()
+    built = build_environment(
+        session, "ENV_PLAN_01",
+        {
+            "objects": [
+                {"id": "seat_by_fountain", "type": "bench",
+                 "position": [2.5, 3.0, 0.0], "rotation": 1.5708},
+                {"id": "old_oak", "type": "tree",
+                 "position": [-5.0, 6.0, 0.0],
+                 "dimensions": {"height": 6.0}},
+                {"id": "north_wall", "type": "wall",
+                 "position": [0.0, 10.0, 0.0],
+                 "dimensions": {"width": 14.0, "height": 3.5}},
+            ],
+        },
+    )
+    manifest = _prop_names(built)
+    assert set(manifest) == {"seat_by_fountain", "old_oak", "north_wall"}
+
+    seat = next(o for o in session.objects
+                if o["name"] == f"ENV_PLAN_01_prop_seat_by_fountain_seat")
+    assert tuple(seat["location"]) == (2.5, 3.0, 0.46), seat["location"]
+    assert abs(seat["rotation"][2] - 1.5708) < 1e-6
+
+    trunk = next(o for o in session.objects
+                 if o["name"] == "ENV_PLAN_01_prop_old_oak_trunk")
+    assert tuple(trunk["location"][0:2]) == (-5.0, 6.0)
+
+    slab = next(o for o in session.objects
+                if o["name"] == "ENV_PLAN_01_prop_north_wall_slab")
+    # cube primitive scales are half-extents: 14m wide, 3.5m tall.
+    assert abs(slab["scale"][0] - 7.0) < 1e-6, slab["scale"]
+    assert abs(slab["scale"][2] - 1.75) < 1e-6, slab["scale"]
+
+    # The plan is recorded in the build result so the manifest is inspectable.
+    assert built.to_dict()["props"]["north_wall"]["type"] == "wall"
+    assert built.to_dict()["props"]["north_wall"]["position"] == [0.0, 10.0, 0.0]
+
+
+def test_a_plan_entry_supersedes_the_default_named_prop():
+    """If the plan already carries a fountain, do not build a second one."""
+    session = _FakeSession()
+    built = build_environment(
+        session, "ENV_PLAN_02",
+        {"objects": [{"id": "main_fountain", "type": "fountain",
+                      "position": [1.0, 2.0, 0.0]}],
+         "props": ["fountain"]},
+    )
+    basins = [o["name"] for o in session.objects if "fountain_basin" in o["name"]]
+    assert len(basins) == 1, f"expected exactly one fountain basin: {basins}"
+
+
+def test_a_free_text_prop_name_lands_in_the_manifest():
+    session = _FakeSession()
+    built = build_environment(
+        session, "ENV_MANIFEST_01",
+        {"props": ["barrel"], "description": "a barrel by the door"},
+    )
+    manifest = built.to_dict()["props"]
+    assert "barrel" in manifest
+    entry = manifest["barrel"]
+    assert entry["type"] == "barrel"
+    assert entry["source"] == "free_text_props"
+    assert any("_body" in n for n in entry["objects"]), entry
+
+
+# ---------------------------------------------------------------------------
 # B. Character builder creates real geometry
 # ---------------------------------------------------------------------------
 

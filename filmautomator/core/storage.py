@@ -149,13 +149,16 @@ CATEGORY_LABELS: dict[str, str] = {
 
 @dataclass
 class StorageEntry:
-    """One path on disk, with what it is and what may be done to it."""
+    """One path on disk, with what it may and what project it belongs to."""
 
     path: Path
     category: str
     bytes: int
     shot_id: str = ""
     version: int = 0
+    #: The project directory this file lives under (first path component),
+    #: so per-project accounting never mixes in another project's files.
+    project_id: str = ""
     #: True when this specific file may be deleted right now.
     disposable: bool = False
     #: Why it may not be. Empty when ``disposable`` is True.
@@ -170,6 +173,7 @@ class StorageEntry:
             "size_mb": round(self.bytes / MB, 2),
             "shot_id": self.shot_id,
             "version": self.version,
+            "project_id": self.project_id,
             "disposable": self.disposable,
             "reason": self.reason,
         }
@@ -187,6 +191,14 @@ class StorageUsage:
     state: StorageState = StorageState.NORMAL
     thresholds: StorageThresholds = field(default_factory=StorageThresholds)
     free_disk_bytes: int = 0
+    #: Set when measured with a project scope; empty for a global walk.
+    project_id: str = ""
+    #: Project-scoped accounting (only meaningful with ``project_id``).
+    project_bytes: int = 0
+    project_disposable_bytes: int = 0
+    project_protected_bytes: int = 0
+    project_by_category: dict[str, int] = field(default_factory=dict)
+    project_retained: list[StorageEntry] = field(default_factory=list)
     #: Entries that look reclaimable but are being held back, with the reason.
     retained: list[StorageEntry] = field(default_factory=list)
     error: str = ""
@@ -212,7 +224,7 @@ class StorageUsage:
         return True
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload: dict[str, Any] = {
             "root": self.root,
             "state": self.state.value,
             "total_bytes": self.total_bytes,
@@ -238,6 +250,30 @@ class StorageUsage:
             "can_start_large_render": self.can_start_large_render,
             "error": self.error,
         }
+        if self.project_id:
+            payload["project"] = {
+                "project_id": self.project_id,
+                "bytes": self.project_bytes,
+                "gb": round(self.project_bytes / GB, 3),
+                "disposable_bytes": self.project_disposable_bytes,
+                "protected_bytes": self.project_protected_bytes,
+                "by_category": {
+                    category: {
+                        "bytes": size,
+                        "gb": round(size / GB, 3),
+                        "label": CATEGORY_LABELS.get(category, category),
+                    }
+                    for category, size in sorted(
+                        self.project_by_category.items(), key=lambda kv: -kv[1]
+                    )
+                },
+                "retained_count": len(self.project_retained),
+                "retained": [e.to_dict() for e in self.project_retained[:50]],
+                "note": ("project-scoped accounting; the global totals above "
+                         "cover the whole workspace against the shared "
+                         "ceiling"),
+            }
+        return payload
 
     def render(self) -> str:
         lines = [
@@ -387,8 +423,15 @@ class StorageGovernor:
 
     # -- measurement -------------------------------------------------------
 
-    def measure(self) -> StorageUsage:
-        """Walk the workspace and classify everything currently on disk."""
+    def measure(self, project_id: str | None = None) -> StorageUsage:
+        """Walk the workspace and classify everything currently on disk.
+
+        With ``project_id`` the walk still covers the whole workspace — the
+        35 GB ceiling is global — but the usage additionally carries a
+        ``project`` section containing only that project's bytes, retained
+        entries and categories. Another project's retained files are never
+        mixed into the project's accounting.
+        """
         usage = StorageUsage(root=str(self.root), thresholds=self.thresholds)
 
         try:
@@ -410,27 +453,52 @@ class StorageGovernor:
             size = path.stat().st_size
             category = classify(relative)
             shot_id, version = parse_shot_location(relative)
+            # The first path component under the workspace root is the
+            # project directory (layout: <workspace>/<project_id>/...).
+            entry_project = relative.parts[0] if relative.parts else ""
 
             usage.total_bytes += size
             usage.by_category[category] = usage.by_category.get(category, 0) + size
 
             entry = StorageEntry(path=path, category=category, bytes=size,
-                                 shot_id=shot_id, version=version)
+                                 shot_id=shot_id, version=version,
+                                 project_id=entry_project)
+
+
+            # Per-project accounting runs alongside the global one so a
+            # project-scoped report never borrows another project's files.
+            if project_id and entry.project_id == project_id:
+                usage.project_bytes += size
+                usage.project_by_category[category] = (
+                    usage.project_by_category.get(category, 0) + size
+                )
 
             if category in PROTECTED_CATEGORIES or category not in DISPOSABLE_CATEGORIES:
                 # Accounted for in the total, but never a deletion candidate.
                 usage.protected_bytes += size
+                if project_id and entry.project_id == project_id:
+                    usage.project_protected_bytes += size
                 continue
 
             if self._may_release(entry):
                 usage.disposable_bytes += size
+                if project_id and entry.project_id == project_id:
+                    usage.project_disposable_bytes += size
             else:
                 usage.protected_bytes += size
                 entry.reason = self._retention_reason(entry)
                 usage.retained.append(entry)
+                if project_id and entry.project_id == project_id:
+                    usage.project_protected_bytes += size
+                    usage.project_retained.append(entry)
 
         # State is computed from the measured total, never assumed up front.
         usage.state = self.thresholds.state_for(usage.total_bytes)
+        if project_id:
+            # A scoped report lists the project's own held-back entries at
+            # the top level; the workspace-wide view stays one call away.
+            usage.project_id = project_id
+            usage.retained = usage.project_retained
         return usage
 
     def render(self) -> str:

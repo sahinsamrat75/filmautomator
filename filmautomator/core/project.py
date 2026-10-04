@@ -274,6 +274,18 @@ class ProjectDB:
         self._conn.execute("PRAGMA foreign_keys=ON")
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # Duplicate ordinals inside a scene would make assembly order
+            # ambiguous, so new databases enforce uniqueness. Databases from
+            # before ordinals were assigned (every shot defaulted to 0) may
+            # already contain duplicates; the constraint is skipped there
+            # rather than blocking startup on history that cannot change.
+            try:
+                self._conn.execute(
+                    "CREATE UNIQUE INDEX IF NOT EXISTS idx_shots_scene_ordinal"
+                    " ON shots(project_id, scene_id, ordinal)"
+                )
+            except (sqlite3.IntegrityError, sqlite3.OperationalError):
+                pass
             self._conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -482,6 +494,20 @@ class ProjectDB:
                  project_id, shot_id),
             )
         else:
+            # Ordinals order the film, so two shots may not share one inside a
+            # scene. Refuse with a clear message rather than letting the unique
+            # index raise an opaque constraint error.
+            clash = self._query_one(
+                "SELECT shot_id FROM shots WHERE project_id=? AND scene_id=?"
+                " AND ordinal=?",
+                (project_id, scene_id, ordinal),
+            )
+            if clash:
+                raise ValueError(
+                    f"ordinal {ordinal} already belongs to shot "
+                    f"{clash['shot_id']!r} in scene {scene_id or '(default)'!r};"
+                    " ordinals must be unique within a scene"
+                )
             self._execute(
                 "INSERT INTO shots(project_id, shot_id, scene_id, ordinal, duration_s,"
                 " spec, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -556,21 +582,41 @@ class ProjectDB:
         return highest + 1
 
     def add_shot_version(self, project_id: str, shot_id: str, *,
+                         version_no: int | None = None,
                          blend_path: str = "", render_path: str = "",
                          video_path: str = "", qa: dict[str, Any] | None = None,
                          notes: str = "") -> ShotVersion:
-        version_no = self.next_version_no(project_id, shot_id)
+        """Create the row for one review round.
+
+        ``version_no`` pins the round to a real preview version when the
+        caller knows it (approval must line up with the preview the director
+        actually looked at); otherwise the next free number is allocated.
+        """
+        if version_no is None:
+            version_no = self.next_version_no(project_id, shot_id)
         version_id = new_id("ver")
         created = _now()
         self._execute(
-            "INSERT INTO shot_versions(version_id, project_id, shot_id, version_no,"
-            " blend_path, render_path, video_path, approved, qa, notes, created_at)"
-            " VALUES(?,?,?,?,?,?,?,0,?,?,?)",
+            "INSERT OR IGNORE INTO shot_versions(version_id, project_id, shot_id,"
+            " version_no, blend_path, render_path, video_path, approved, qa,"
+            " notes, created_at) VALUES(?,?,?,?,?,?,?,0,?,?,?)",
             (version_id, project_id, shot_id, version_no, blend_path, render_path,
              video_path, json.dumps(qa or {}), notes, created),
         )
-        return ShotVersion(version_id, shot_id, version_no, blend_path,
-                           render_path, video_path, False, qa or {}, notes, created)
+        row = self._query_one(
+            "SELECT * FROM shot_versions WHERE project_id=? AND shot_id=?"
+            " AND version_no=?",
+            (project_id, shot_id, version_no),
+        )
+        if row is None:  # pragma: no cover - INSERT OR IGNORE always lands
+            raise RuntimeError("failed to record the shot version")
+        return ShotVersion(
+            version_id=row["version_id"], shot_id=row["shot_id"],
+            version_no=row["version_no"], blend_path=row["blend_path"],
+            render_path=row["render_path"], video_path=row["video_path"],
+            approved=bool(row["approved"]), qa=json.loads(row["qa"] or "{}"),
+            notes=row["notes"], created_at=row["created_at"],
+        )
 
     def update_shot_version(self, project_id: str, shot_id: str, version_no: int,
                             **fields: Any) -> None:

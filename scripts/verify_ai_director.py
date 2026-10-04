@@ -40,6 +40,46 @@ PASSED = 0
 FAILED = 0
 
 
+def wait_for_render_job(client, project_id: str, shot_id: str, *,
+                        timeout_s: float = 3600.0, poll_s: float = 10.0,
+                        on_tick=None) -> tuple[dict | None, dict]:
+    """Poll get_render until the shot's render job reaches a terminal state.
+
+    The whole point of the render lifecycle is that these polls answer
+    instantly while Blender renders, so every tick also proves the server
+    stayed responsive: a ``list_projects`` round-trip is timed each poll and
+    must return within a few seconds.
+    """
+    deadline = time.time() + timeout_s
+    job: dict = {}
+    responsive = True
+    while time.time() < deadline:
+        started = time.time()
+        listing = client.call("list_projects", {})
+        roundtrip = time.time() - started
+        if listing.get("_is_error") or roundtrip > 10.0:
+            responsive = False
+        status = client.call("get_render",
+                             {"project_id": project_id, "shot_id": shot_id})
+        job = status.get("render_job") or {}
+        progress = job.get("progress") or {}
+        if callable(on_tick):
+            on_tick(job, roundtrip)
+        else:
+            print(f"        {job.get('state', '?')} "
+                  f"({progress.get('frames_done', 0)}/"
+                  f"{progress.get('frames_total', '?')} frames, "
+                  f"server answered in {roundtrip:.2f}s)")
+        if job.get("terminal"):
+            if not responsive:
+                print("        WARNING: server latency exceeded 10s during "
+                      "the render — the control plane blocked")
+            return status, job
+        time.sleep(poll_s)
+    print("        render job timed out in the polling loop")
+    return None, job
+
+
 def check(label: str, condition: bool, detail: str = "") -> None:
     global PASSED, FAILED
     if condition:
@@ -304,13 +344,28 @@ def main() -> int:
                                      "shot_id": shot_id})
         before = client.call("get_storage_status", {"project_id": project_id})
 
-        final = client.call("finalize_shot", {
+        submitted = client.call("finalize_shot", {
             "project_id": project_id, "shot_id": shot_id,
             "width": args.width, "height": args.height,
             "engine": args.engine,
         })
-        check("finalize_shot succeeded", not final.get("_is_error"),
-              str(final)[:400])
+        check("finalize_shot accepted the job", not submitted.get("_is_error"),
+              str(submitted)[:400])
+        check("finalize_shot returned immediately with a render job",
+              bool(submitted.get("job_id"))
+              and submitted.get("state") in ("QUEUED", "RENDERING"),
+              str(submitted)[:300])
+
+        # The server must stay responsive for the whole render. Every poll
+        # below is a tools/call that has to answer while Blender is busy.
+        print("\n  --- final render (background job) ---")
+        status, job = wait_for_render_job(client, project_id, shot_id)
+        check("render job reached a terminal state",
+              bool(job.get("terminal")), str(job)[:200])
+        check("render job COMPLETED", job.get("state") == "COMPLETED",
+              str(job.get("error") or job.get("state"))[:300])
+        final = (status or {}).get("result") or job.get("result") or {}
+
         check("shot satisfied the finalization contract",
               final.get("final") is True,
               str(final.get("failed") or final.get("reason"))[:300])

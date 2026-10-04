@@ -330,7 +330,7 @@ neighbours.
 | **Storage** | `get_storage_status` `cleanup_storage` |
 | **Blender** | `inspect_blender` `inspect_scene` `inspect_objects` `get_viewport_preview` |
 | **Vision** | `inspect_preview` `get_visual_evaluation` |
-| **Artifacts** | `list_artifacts` `get_artifact` `get_preview` `get_render` `get_final_movie` |
+| **Artifacts** | `list_artifacts` `get_artifact` `get_preview` `get_render` `cancel_render` `get_final_movie` |
 | **Agents** | `list_agents` `get_agent_status` `get_agent_activity` |
 | **QA** | `run_qa` `get_qa_status` `get_qa_report` |
 | **Control** | `pause` `resume` `stop` `get_client_compatibility` |

@@ -36,7 +36,7 @@ import sys
 import traceback
 
 import bpy  # type: ignore[import-not-found]  # provided by Blender at runtime
-from mathutils import Vector  # type: ignore[import-not-found]
+from mathutils import Matrix, Vector  # type: ignore[import-not-found]
 
 
 # ---------------------------------------------------------------------------
@@ -210,39 +210,41 @@ def op_get_scene_state(_args: dict) -> dict:
         for m in bpy.data.materials
     ]
 
-    armatures = [
-        {
+    armatures = []
+    for o in bpy.data.objects:
+        if o.type != "ARMATURE":
+            continue
+        pose_state = []
+        for pb in o.pose.bones:
+            pose_state.append({
+                "name": pb.name,
+                # Both representations: pose bones default to quaternion
+                # rotation, but a rig may switch to euler — report both so a
+                # readback can never miss a change that is really there.
+                "rotation_quaternion": _to_list(pb.rotation_quaternion),
+                "rotation_euler": _to_list(pb.rotation_euler),
+                "location": _to_list(pb.location),
+            })
+            if len(pose_state) >= 64:
+                break
+        armatures.append({
             "name": o.name,
             "bone_count": len(o.data.bones),
             "bones": [b.name for b in o.data.bones][:64],
-        }
-        for o in bpy.data.objects
-        if o.type == "ARMATURE"
-    ]
+            "pose": pose_state,
+        })
 
     actions = []
     for a in bpy.data.actions:
-        try:
-            fcurves = list(a.fcurves)
-        except AttributeError:
-            # Blender 5.x layered actions expose channels, not fcurves.
-            fcurves = []
-            try:
-                for layer in a.layers:
-                    for strip in layer.strips:
-                        channelbag = getattr(strip, "channelbag", lambda: None)()
-                        if channelbag is not None:
-                            fcurves.extend(list(channelbag.fcurves))
-            except Exception:
-                pass
-        try:
-            frame_range = _to_list(a.frame_range)
-        except Exception:
-            frame_range = []
+        # Reuse the version-aware summary: the naive fcurve read reports 0 on
+        # Blender 5.x layered actions even when keyframes are present, which
+        # would make real animation look like none.
+        summary = _action_animation_summary(a)
         actions.append({
-            "name": a.name,
-            "frame_range": frame_range,
-            "fcurve_count": len(fcurves),
+            "name": summary["name"],
+            "frame_range": summary["frame_range"] or _to_list(a.frame_range),
+            "fcurve_count": summary["fcurve_count"],
+            "keyframe_count": summary["keyframe_count"],
         })
 
     constraints = [
@@ -369,6 +371,12 @@ def op_create_primitive(args: dict) -> dict:
                 kwargs[size_kwarg] = args["radius"]
             elif "size" in args:
                 kwargs[size_kwarg] = args["size"]
+        if kind in ("cylinder", "cone") and "depth" in args:
+            # Height of a cylinder/cone. Without this every cylinder silently
+            # became Blender's 2 m default regardless of what the builder asked
+            # for — fountain basins, tree trunks and columns all came out the
+            # same wrong size.
+            kwargs["depth"] = float(args["depth"])
     op(**kwargs)
 
     obj = bpy.context.active_object
@@ -424,6 +432,14 @@ def op_set_transform(args: dict) -> dict:
     if "parent" in args:
         parent = args["parent"]
         obj.parent = _object_ref(parent) if parent else None
+        # Keep the child where it already is in the world. Assigning `.parent`
+        # from Python does not update `matrix_parent_inverse` the way the UI's
+        # "Set Parent (Keep Transform)" does, so without this every parented
+        # object would inherit its parent's transform a second time and land
+        # offset from where it was built.
+        obj.matrix_parent_inverse = (
+            obj.parent.matrix_world.inverted() if obj.parent else Matrix.Identity(4)
+        )
     return {
         "name": obj.name,
         "location": _to_list(obj.location),
@@ -706,14 +722,17 @@ def op_pose_bone(args: dict) -> dict:
         raise KeyError("armature %r has no bone %r" % (arm.name, args["bone"]))
     keyed = []
     frame = args.get("frame")
-    if rotation := args.get("rotation_euler"):
+    # Presence, not truthiness: a rotation of (0, 0, 0) is a real instruction
+    # -- it returns the bone to rest -- and testing the value would silently
+    # drop it, making a bone impossible to key back from a pose.
+    if args.get("rotation_euler") is not None:
         bone.rotation_mode = "XYZ"
-        bone.rotation_euler = rotation
+        bone.rotation_euler = args["rotation_euler"]
         if frame is not None:
             bone.keyframe_insert(data_path="rotation_euler", frame=int(frame))
             keyed.append("rotation_euler")
-    if location := args.get("location"):
-        bone.location = location
+    if args.get("location") is not None:
+        bone.location = args["location"]
         if frame is not None:
             bone.keyframe_insert(data_path="location", frame=int(frame))
             keyed.append("location")
@@ -721,6 +740,52 @@ def op_pose_bone(args: dict) -> dict:
             "rotation_euler": _to_list(bone.rotation_euler),
             "location": _to_list(bone.location), "keyed": keyed,
             "frame": frame}
+
+
+def op_bind_armature(args: dict) -> dict:
+    """Bind mesh objects to bones, so posing them actually moves the mesh.
+
+    Creating an armature beside a mesh does not connect the two: without a
+    vertex group per bone and an Armature modifier, `pose_bone` rotates bones
+    that deform nothing and the character never moves no matter what the pose
+    vocabulary says.
+
+    Each binding is ``{"object": name, "bone": name}``. Every vertex of the
+    object is weighted 1.0 to that bone, which is rigid skinning -- one bone
+    per part. That is the right model for a segmented procedural character
+    whose parts are whole primitive meshes, and it makes every pose in
+    ``POSES`` visible.
+    """
+    arm = _object_ref(args["armature"])
+    if arm.type != "ARMATURE":
+        raise ValueError("%r is a %s, not an armature" % (arm.name, arm.type))
+
+    bound: list[dict] = []
+    for entry in args.get("bindings") or []:
+        obj = _object_ref(entry["object"])
+        bone = str(entry["bone"])
+        if arm.pose.bones.get(bone) is None:
+            raise KeyError("armature %r has no bone %r" % (arm.name, bone))
+        if obj.type != "MESH":
+            raise ValueError("%r is a %s, not a mesh" % (obj.name, obj.type))
+
+        for group in list(obj.vertex_groups):
+            obj.vertex_groups.remove(group)
+        group = obj.vertex_groups.new(name=bone)
+        group.add(range(len(obj.data.vertices)), 1.0, "REPLACE")
+
+        modifier = None
+        for existing in obj.modifiers:
+            if existing.type == "ARMATURE":
+                modifier = existing
+                break
+        if modifier is None:
+            modifier = obj.modifiers.new(name="Armature", type="ARMATURE")
+        modifier.object = arm
+        bound.append({"object": obj.name, "bone": bone,
+                      "vertices": len(obj.data.vertices)})
+
+    return {"armature": arm.name, "bound": bound, "count": len(bound)}
 
 
 def op_object_manifest(args: dict) -> dict:
@@ -1501,6 +1566,7 @@ OPERATIONS = {
     "duplicate_object": op_duplicate_object,
     "create_armature": op_create_armature,
     "pose_bone": op_pose_bone,
+    "bind_armature": op_bind_armature,
     "create_material": op_create_material,
     "assign_material": op_assign_material,
     "create_light": op_create_light,
